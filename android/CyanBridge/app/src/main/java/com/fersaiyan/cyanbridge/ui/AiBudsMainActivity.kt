@@ -530,6 +530,42 @@ private fun DeviceTab(
                     }
                 }
             }
+
+            // Жесты тачпада (правая дужка)
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                shape = RoundedCornerShape(18.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Жесты тачпада (правая дужка)", fontWeight = FontWeight.SemiBold)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                tuneBuds.applyTouchpadPreset(0)
+                                Toast.makeText(context, "Применено: 1-Пауза, 2-След, 3-Пред", Toast.LENGTH_SHORT).show()
+                            },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(12.dp),
+                        ) {
+                            Text("1-Пауза / 2-След / 3-Пред", maxLines = 1)
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                tuneBuds.applyTouchpadPreset(1)
+                                Toast.makeText(context, "Применено: 1-Нет, 2-Пауза, 3-След", Toast.LENGTH_SHORT).show()
+                            },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(12.dp),
+                        ) {
+                            Text("Завод", maxLines = 1)
+                        }
+                    }
+                }
+            }
         }
     }
 
