@@ -61,6 +61,7 @@ import kotlin.math.exp
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.tanh
 
 enum class ColorPreset(val label: String) {
@@ -80,28 +81,43 @@ data class MediaProcessingOptions(
 }
 
 private data class GradeParams(
+    val blackCrush: Float,
+    val gamma: Float,
     val contrast: Float,
-    val shadowLift: Float,
-    val vibrance: Float,
+    val clarity: Float,
     val sharpness: Float,
+    val baseSat: Float,
+    val vibrance: Float,
+    val warmCr: Float,
+    val warmCb: Float,
     val chromaDenoise: Float,
 )
 
 private fun ColorPreset.toGradeParams(): GradeParams? = when (this) {
     ColorPreset.ORIGINAL -> null
     ColorPreset.META_DAY -> GradeParams(
-        contrast = 0.24f,
-        shadowLift = 0.14f,
-        vibrance = 0.22f,
-        sharpness = 0.55f,
+        blackCrush = 0.032f,
+        gamma = 0.96f,
+        contrast = 0.36f,
+        clarity = 0.28f,
+        sharpness = 1.10f,
+        baseSat = 1.12f,
+        vibrance = 0.36f,
+        warmCr = 0.005f,
+        warmCb = -0.004f,
         chromaDenoise = 0.72f,
     )
     ColorPreset.NIGHT_CAR -> GradeParams(
+        blackCrush = 0.012f,
+        gamma = 0.78f,
         contrast = 0.16f,
-        shadowLift = 0.34f,
-        vibrance = 0.14f,
-        sharpness = 0.38f,
-        chromaDenoise = 0.90f,
+        clarity = 0.22f,
+        sharpness = 0.85f,
+        baseSat = 1.04f,
+        vibrance = 0.22f,
+        warmCr = 0.002f,
+        warmCb = 0.000f,
+        chromaDenoise = 0.92f,
     )
 }
 
@@ -208,6 +224,9 @@ class MetaVideoProcessor(private val context: Context) {
         }
     }
 
+    /**
+     * Полный 1-в-1 аналог GPU-шейдера ProCinemaShaderProgram (для фото и точного превью «До / После»).
+     */
     fun applyPhotoEffects(source: Bitmap, options: MediaProcessingOptions): Bitmap {
         val working = if (options.upscale2K && source.height < 1536) {
             val scale = 1536f / source.height.toFloat()
@@ -242,6 +261,7 @@ class MetaVideoProcessor(private val context: Context) {
 
         val outPixels = IntArray(size)
         val sigma = 0.07f
+        val invDehaze = 1f / (1f - params.blackCrush)
 
         for (row in 0 until h) {
             val rowOff = row * w
@@ -249,6 +269,8 @@ class MetaVideoProcessor(private val context: Context) {
             val rowD = min(h - 1, row + 1) * w
             val rowU2 = max(0, row - 2) * w
             val rowD2 = min(h - 1, row + 2) * w
+            val rowU3 = max(0, row - 3) * w
+            val rowD3 = min(h - 1, row + 3) * w
 
             for (col in 0 until w) {
                 val idx = rowOff + col
@@ -256,6 +278,8 @@ class MetaVideoProcessor(private val context: Context) {
                 val colR = min(w - 1, col + 1)
                 val colL2 = max(0, col - 2)
                 val colR2 = min(w - 1, col + 2)
+                val colL3 = max(0, col - 3)
+                val colR3 = min(w - 1, col + 3)
 
                 val iL = rowOff + colL
                 val iR = rowOff + colR
@@ -271,16 +295,21 @@ class MetaVideoProcessor(private val context: Context) {
                 val yR = yArr[iR]
                 val yU = yArr[iU]
                 val yD = yArr[iD]
+                val yL2 = yArr[iL2]
+                val yR2 = yArr[iR2]
+                val yU2 = yArr[iU2]
+                val yD2 = yArr[iD2]
 
+                // 1. Билатеральное подавление цветового шума (только Cb/Cr)
                 val w0 = 1.5f
                 val wL = fastWeight(abs(yL - y0) / sigma)
                 val wR = fastWeight(abs(yR - y0) / sigma)
                 val wU = fastWeight(abs(yU - y0) / sigma)
                 val wD = fastWeight(abs(yD - y0) / sigma)
-                val wL2 = fastWeight(abs(yArr[iL2] - y0) / sigma) * 0.7f
-                val wR2 = fastWeight(abs(yArr[iR2] - y0) / sigma) * 0.7f
-                val wU2 = fastWeight(abs(yArr[iU2] - y0) / sigma) * 0.7f
-                val wD2 = fastWeight(abs(yArr[iD2] - y0) / sigma) * 0.7f
+                val wL2 = fastWeight(abs(yL2 - y0) / sigma) * 0.7f
+                val wR2 = fastWeight(abs(yR2 - y0) / sigma) * 0.7f
+                val wU2 = fastWeight(abs(yU2 - y0) / sigma) * 0.7f
+                val wD2 = fastWeight(abs(yD2 - y0) / sigma) * 0.7f
 
                 val wSum = w0 + wL + wR + wU + wD + wL2 + wR2 + wU2 + wD2
                 val avgCb = (cbArr[idx] * w0 +
@@ -293,27 +322,38 @@ class MetaVideoProcessor(private val context: Context) {
                 var cb = cbArr[idx] + (avgCb - cbArr[idx]) * params.chromaDenoise
                 var cr = crArr[idx] + (avgCr - crArr[idx]) * params.chromaDenoise
 
+                // Гасим цветной шум на почти серых стенах/потолках
                 val chromaMag = hypot(cb.toDouble(), cr.toDouble()).toFloat()
-                val neutralKeep = 0.45f + 0.55f * smoothstep(0.010f, 0.042f, chromaMag)
+                val neutralKeep = 0.35f + 0.65f * smoothstep(0.012f, 0.045f, chromaMag)
                 cb *= neutralKeep
                 cr *= neutralKeep
 
-                val yAvg = (yL + yR + yU + yD) * 0.25f
-                val detail = y0 - yAvg
-                val edgeMask = smoothstep(0.014f, 0.055f, abs(detail))
-                val yMin = min(y0, min(min(yL, yR), min(yU, yD)))
-                val yMax = max(y0, max(max(yL, yR), max(yU, yD)))
-                var y = (y0 + detail * params.sharpness * edgeMask).coerceIn(yMin, yMax)
+                // 2. Резкость (Unsharp Mask с отсечкой шума) + локальный контраст (Clarity 3px)
+                val blur1 = (yL + yR + yU + yD) * 0.25f
+                val detail1 = y0 - blur1
+                val edgeMask = smoothstep(0.008f, 0.030f, abs(detail1))
+                val sharpDelta = (detail1 * params.sharpness * edgeMask).coerceIn(-0.18f, 0.18f)
 
-                y += params.shadowLift * y * (1f - y) * (1f - y)
+                val blur3 = (yL2 + yR2 + yU2 + yD2 +
+                    yArr[rowU3 + colL3] + yArr[rowU3 + colR3] +
+                    yArr[rowD3 + colL3] + yArr[rowD3 + colR3]) * 0.125f
+                val clarityDelta = ((y0 - blur3) * params.clarity).coerceIn(-0.12f, 0.12f)
+
+                var y = (y0 + sharpDelta + clarityDelta).coerceIn(0f, 1f)
+
+                // 3. Снятие серой пелены (black point) + гамма + киношная S-кривая
+                y = ((y - params.blackCrush) * invDehaze).coerceIn(0f, 1f)
+                y = y.coerceAtLeast(0.0001f).pow(params.gamma)
                 val sCurve = y * y * (3f - 2f * y)
                 y = (y + (sCurve - y) * params.contrast).coerceIn(0f, 1f)
 
-                val vibMask = smoothstep(0.025f, 0.09f, chromaMag) *
-                    (1f - smoothstep(0.22f, 0.42f, chromaMag))
-                val vibScale = 1f + params.vibrance * vibMask
-                cb *= vibScale
-                cr *= vibScale
+                // 4. Умный Vibrance + деликатный дневной баланс (не красит тени и серый)
+                val vibMask = smoothstep(0.018f, 0.070f, chromaMag) *
+                    (1f - smoothstep(0.24f, 0.44f, chromaMag))
+                val satScale = params.baseSat * (1f + params.vibrance * vibMask)
+                val warmMask = smoothstep(0.18f, 0.55f, y) * smoothstep(0.018f, 0.060f, chromaMag)
+                cb = cb * satScale + params.warmCb * warmMask
+                cr = cr * satScale + params.warmCr * warmMask
 
                 val rOut = ((y + cr * 1.5748f).coerceIn(0f, 1f) * 255f + 0.5f).toInt()
                 val gOut = ((y - cb * 0.1873f - cr * 0.4681f).coerceIn(0f, 1f) * 255f + 0.5f).toInt()
@@ -530,10 +570,15 @@ private class ProCinemaShaderProgram(
             precision highp float;
             uniform sampler2D uTexSampler;
             uniform vec2 uTexelSize;
+            uniform float uBlackCrush;
+            uniform float uGamma;
             uniform float uContrast;
-            uniform float uShadowLift;
-            uniform float uVibrance;
+            uniform float uClarity;
             uniform float uSharpness;
+            uniform float uBaseSat;
+            uniform float uVibrance;
+            uniform float uWarmCr;
+            uniform float uWarmCb;
             uniform float uChromaDenoise;
             varying vec2 vTexCoord;
 
@@ -565,6 +610,12 @@ private class ProCinemaShaderProgram(
                 vec3 yccU2 = rgb2ycc(texture2D(uTexSampler, vTexCoord + vec2(0.0,  2.0 * uTexelSize.y)).rgb);
                 vec3 yccD2 = rgb2ycc(texture2D(uTexSampler, vTexCoord + vec2(0.0, -2.0 * uTexelSize.y)).rgb);
 
+                float yUL3 = dot(texture2D(uTexSampler, vTexCoord + vec2(-3.0 * uTexelSize.x,  3.0 * uTexelSize.y)).rgb, vec3(0.2126, 0.7152, 0.0722));
+                float yUR3 = dot(texture2D(uTexSampler, vTexCoord + vec2( 3.0 * uTexelSize.x,  3.0 * uTexelSize.y)).rgb, vec3(0.2126, 0.7152, 0.0722));
+                float yDL3 = dot(texture2D(uTexSampler, vTexCoord + vec2(-3.0 * uTexelSize.x, -3.0 * uTexelSize.y)).rgb, vec3(0.2126, 0.7152, 0.0722));
+                float yDR3 = dot(texture2D(uTexSampler, vTexCoord + vec2( 3.0 * uTexelSize.x, -3.0 * uTexelSize.y)).rgb, vec3(0.2126, 0.7152, 0.0722));
+
+                // 1. Билатеральное подавление цветового шума (Cb/Cr)
                 float sigma = 0.07;
                 float w0 = 1.5;
                 float wL = exp(-abs(yccL.x - ycc0.x) / sigma);
@@ -583,22 +634,31 @@ private class ProCinemaShaderProgram(
                 vec2 chroma = mix(ycc0.yz, avgChroma, uChromaDenoise);
 
                 float chromaMag = length(chroma);
-                float neutralSuppress = smoothstep(0.010, 0.042, chromaMag);
-                chroma *= mix(0.45, 1.0, neutralSuppress);
+                float neutralKeep = mix(0.35, 1.0, smoothstep(0.012, 0.045, chromaMag));
+                chroma *= neutralKeep;
 
-                float yAvg = (yccL.x + yccR.x + yccU.x + yccD.x) * 0.25;
-                float detail = ycc0.x - yAvg;
-                float edgeMask = smoothstep(0.014, 0.055, abs(detail));
-                float yMin = min(ycc0.x, min(min(yccL.x, yccR.x), min(yccU.x, yccD.x)));
-                float yMax = max(ycc0.x, max(max(yccL.x, yccR.x), max(yccU.x, yccD.x)));
-                float y = clamp(ycc0.x + detail * uSharpness * edgeMask, yMin, yMax);
+                // 2. Честный Unsharp Mask + Clarity (3px) без самоблокировки
+                float blur1 = (yccL.x + yccR.x + yccU.x + yccD.x) * 0.25;
+                float detail1 = ycc0.x - blur1;
+                float edgeMask = smoothstep(0.008, 0.030, abs(detail1));
+                float sharpDelta = clamp(detail1 * uSharpness * edgeMask, -0.18, 0.18);
 
-                y = y + uShadowLift * y * (1.0 - y) * (1.0 - y);
+                float blur3 = (yccL2.x + yccR2.x + yccU2.x + yccD2.x + yUL3 + yUR3 + yDL3 + yDR3) * 0.125;
+                float clarityDelta = clamp((ycc0.x - blur3) * uClarity, -0.12, 0.12);
+
+                float y = clamp(ycc0.x + sharpDelta + clarityDelta, 0.0, 1.0);
+
+                // 3. Dehaze (точка чёрного) + гамма + S-кривая
+                y = clamp((y - uBlackCrush) / (1.0 - uBlackCrush), 0.0, 1.0);
+                y = pow(max(y, 0.0001), uGamma);
                 float sCurve = y * y * (3.0 - 2.0 * y);
                 y = clamp(mix(y, sCurve, uContrast), 0.0, 1.0);
 
-                float vibMask = smoothstep(0.025, 0.09, chromaMag) * (1.0 - smoothstep(0.22, 0.42, chromaMag));
-                chroma *= (1.0 + uVibrance * vibMask);
+                // 4. Умный Vibrance + чистый баланс цвета
+                float vibMask = smoothstep(0.018, 0.070, chromaMag) * (1.0 - smoothstep(0.24, 0.44, chromaMag));
+                float satScale = uBaseSat * (1.0 + uVibrance * vibMask);
+                float warmMask = smoothstep(0.18, 0.55, y) * smoothstep(0.018, 0.060, chromaMag);
+                chroma = chroma * satScale + vec2(uWarmCb, uWarmCr) * warmMask;
 
                 gl_FragColor = vec4(ycc2rgb(vec3(y, chroma)), centerSample.a);
             }
@@ -626,10 +686,15 @@ private class ProCinemaShaderProgram(
     private var aTexLoc = -1
     private var uSamplerLoc = -1
     private var uTexelSizeLoc = -1
+    private var uBlackCrushLoc = -1
+    private var uGammaLoc = -1
     private var uContrastLoc = -1
-    private var uShadowLiftLoc = -1
-    private var uVibranceLoc = -1
+    private var uClarityLoc = -1
     private var uSharpnessLoc = -1
+    private var uBaseSatLoc = -1
+    private var uVibranceLoc = -1
+    private var uWarmCrLoc = -1
+    private var uWarmCbLoc = -1
     private var uChromaDenoiseLoc = -1
     private var texWidth = 1
     private var texHeight = 1
@@ -654,10 +719,15 @@ private class ProCinemaShaderProgram(
 
         GLES20.glUniform1i(uSamplerLoc, 0)
         GLES20.glUniform2f(uTexelSizeLoc, 1f / texWidth.toFloat(), 1f / texHeight.toFloat())
+        GLES20.glUniform1f(uBlackCrushLoc, params.blackCrush)
+        GLES20.glUniform1f(uGammaLoc, params.gamma)
         GLES20.glUniform1f(uContrastLoc, params.contrast)
-        GLES20.glUniform1f(uShadowLiftLoc, params.shadowLift)
-        GLES20.glUniform1f(uVibranceLoc, params.vibrance)
+        GLES20.glUniform1f(uClarityLoc, params.clarity)
         GLES20.glUniform1f(uSharpnessLoc, params.sharpness)
+        GLES20.glUniform1f(uBaseSatLoc, params.baseSat)
+        GLES20.glUniform1f(uVibranceLoc, params.vibrance)
+        GLES20.glUniform1f(uWarmCrLoc, params.warmCr)
+        GLES20.glUniform1f(uWarmCbLoc, params.warmCb)
         GLES20.glUniform1f(uChromaDenoiseLoc, params.chromaDenoise)
 
         vertexBuffer.position(0)
@@ -704,10 +774,15 @@ private class ProCinemaShaderProgram(
         aTexLoc = GLES20.glGetAttribLocation(prog, "aTexCoord")
         uSamplerLoc = GLES20.glGetUniformLocation(prog, "uTexSampler")
         uTexelSizeLoc = GLES20.glGetUniformLocation(prog, "uTexelSize")
+        uBlackCrushLoc = GLES20.glGetUniformLocation(prog, "uBlackCrush")
+        uGammaLoc = GLES20.glGetUniformLocation(prog, "uGamma")
         uContrastLoc = GLES20.glGetUniformLocation(prog, "uContrast")
-        uShadowLiftLoc = GLES20.glGetUniformLocation(prog, "uShadowLift")
-        uVibranceLoc = GLES20.glGetUniformLocation(prog, "uVibrance")
+        uClarityLoc = GLES20.glGetUniformLocation(prog, "uClarity")
         uSharpnessLoc = GLES20.glGetUniformLocation(prog, "uSharpness")
+        uBaseSatLoc = GLES20.glGetUniformLocation(prog, "uBaseSat")
+        uVibranceLoc = GLES20.glGetUniformLocation(prog, "uVibrance")
+        uWarmCrLoc = GLES20.glGetUniformLocation(prog, "uWarmCr")
+        uWarmCbLoc = GLES20.glGetUniformLocation(prog, "uWarmCb")
         uChromaDenoiseLoc = GLES20.glGetUniformLocation(prog, "uChromaDenoise")
     }
 
