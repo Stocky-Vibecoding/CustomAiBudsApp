@@ -71,6 +71,7 @@ data class TuneBudsState(
     val isVideoRecording: Boolean = false,
     val isAudioRecording: Boolean = false,
     val gestureStatus: String? = null,
+    val lastIncomingPacket: String? = null,
     val lastError: String? = null,
 )
 
@@ -82,6 +83,21 @@ class TuneBudsManager private constructor(context: Context) {
         private const val CAMERA_CLOSE_MAX_ATTEMPTS = 15
         private const val FILE_MANAGER_RETRY_MS = 1_000L
         private const val FILE_MANAGER_MAX_ATTEMPTS = 30
+        private const val CONNECT_GRACE_MS = 5_000L
+
+        private val ROUTINE_COMMANDS = setOf(
+            TuneBudsProtocol.CMD_DEVICE_INFO,
+            TuneBudsProtocol.CMD_STORAGE,
+            TuneBudsProtocol.CMD_MEDIA_COUNTS,
+            TuneBudsProtocol.CMD_COPROCESSOR_VERSION,
+            TuneBudsProtocol.CMD_CAMERA_COPROCESSOR_INFO,
+            TuneBudsProtocol.CMD_WORK_STATE,
+            TuneBudsProtocol.CMD_WIFI_STATE,
+            TuneBudsProtocol.CMD_FILE_MANAGER,
+            TuneBudsProtocol.CMD_AI_PICTURE,
+            TuneBudsProtocol.INFO_BATTERY,
+            TuneBudsProtocol.INFO_IN_EAR_STATE,
+        )
 
         @Volatile
         private var instance: TuneBudsManager? = null
@@ -100,6 +116,8 @@ class TuneBudsManager private constructor(context: Context) {
     private val _aiPhotos = MutableSharedFlow<ByteArray>(extraBufferCapacity = 1)
     private val _aiEvents = MutableSharedFlow<TuneBudsAiEvent>(extraBufferCapacity = 16)
     private var connectJob: Job? = null
+    @Volatile
+    private var connectedAtMs: Long = 0L
 
     val state: StateFlow<TuneBudsState> = _state.asStateFlow()
     val aiPhotos: SharedFlow<ByteArray> = _aiPhotos.asSharedFlow()
@@ -114,6 +132,9 @@ class TuneBudsManager private constructor(context: Context) {
                     TuneBudsSppState.CONNECTING -> "Подключение..."
                     TuneBudsSppState.CONNECTED -> "Подключено"
                     TuneBudsSppState.ERROR -> _state.value.lastError ?: "Ошибка подключения"
+                }
+                if (transportState != TuneBudsSppState.CONNECTED) {
+                    connectedAtMs = 0L
                 }
                 _state.value = _state.value.copy(
                     connectionLabel = label,
@@ -146,6 +167,7 @@ class TuneBudsManager private constructor(context: Context) {
             return
         }
         connectJob?.cancel()
+        connectedAtMs = 0L
         _state.value = TuneBudsState(
             connectionLabel = "Подключение...",
             protocolState = TuneBudsSppState.CONNECTING.name,
@@ -157,6 +179,7 @@ class TuneBudsManager private constructor(context: Context) {
                 updateError(error.message ?: "Не удалось подключиться к очкам")
                 return@launch
             }
+            connectedAtMs = System.currentTimeMillis()
             _state.value = _state.value.copy(
                 connectionLabel = "Подключено",
                 protocolState = TuneBudsSppState.CONNECTED.name,
@@ -164,12 +187,14 @@ class TuneBudsManager private constructor(context: Context) {
             )
             runCatching { initializeProtocol() }
                 .onFailure { error -> updateError("Ошибка инициализации: ${error.message}") }
+            connectedAtMs = System.currentTimeMillis()
         }
     }
 
     fun disconnect() {
         connectJob?.cancel()
         connectJob = null
+        connectedAtMs = 0L
         client.disconnect()
     }
 
@@ -227,37 +252,13 @@ class TuneBudsManager private constructor(context: Context) {
         _state.value = _state.value.copy(inEarDetectionEnabled = enabled, lastError = null)
     }
 
-    fun setTapGesture(tapCount: Int, keyFunction: Int) = launchCommand("настроить жест тачпада") {
-        val keys = when (tapCount) {
-            1 -> listOf(TuneBudsProtocol.KEY_RIGHT_SINGLE, TuneBudsProtocol.KEY_LEFT_SINGLE)
-            2 -> listOf(TuneBudsProtocol.KEY_RIGHT_DOUBLE, TuneBudsProtocol.KEY_LEFT_DOUBLE)
-            3 -> listOf(TuneBudsProtocol.KEY_RIGHT_TRIPLE, TuneBudsProtocol.KEY_LEFT_TRIPLE)
-            else -> return@launchCommand
-        }
-        val statuses = mutableListOf<String>()
-        for (keyType in keys) {
-            val resp = runCatching {
-                request(TuneBudsProtocol.CMD_KEY, TuneBudsProtocol.buildKeyPayload(keyType, keyFunction))
-            }.getOrNull()
-            val code = resp?.let { TuneBudsProtocol.parseStatus(it.payload) }
-            statuses += "ch$keyType=${code ?: "err"}"
-            delay(100L)
-        }
-        _state.value = _state.value.copy(
-            gestureStatus = "Жест (${tapCount}×) отправлен: ${statuses.joinToString(", ")}",
-            lastError = null,
-        )
-    }
-
     fun applyTouchpadPreset(preset: Int) = launchCommand("применить пресет жестов") {
         val actions: List<Pair<Int, Int>> = when (preset) {
-            // 0: Удобный (1× Пауза, 2× След., 3× Пред.)
             0 -> listOf(
                 1 to TuneBudsProtocol.KEY_FUNC_PLAY_PAUSE,
                 2 to TuneBudsProtocol.KEY_FUNC_NEXT,
                 3 to TuneBudsProtocol.KEY_FUNC_PREV,
             )
-            // 1: Заводской (1× Выкл, 2× Пауза, 3× След.)
             else -> listOf(
                 1 to TuneBudsProtocol.KEY_FUNC_NONE,
                 2 to TuneBudsProtocol.KEY_FUNC_PLAY_PAUSE,
@@ -285,7 +286,7 @@ class TuneBudsManager private constructor(context: Context) {
         val statusText = if (okCount > 0) {
             "Пресет сохранён в памяти очков"
         } else {
-            "Прошивка отклонила смену жестов (ответ: ${codes.distinct().joinToString()})"
+            "Прошивка не поддерживает смену жестов (код: ${codes.distinct().joinToString()})"
         }
         _state.value = _state.value.copy(gestureStatus = statusText, lastError = null)
     }
@@ -549,6 +550,14 @@ class TuneBudsManager private constructor(context: Context) {
     }
 
     private fun handleFrame(frame: TuneBudsFrame) {
+        // Логируем любые нестандартные входящие события от очков (не RESPONSE и не опрос статуса)
+        if (frame.type != TuneBudsFrameType.RESPONSE && frame.command !in ROUTINE_COMMANDS) {
+            val hex = frame.payload.take(12).joinToString(" ") { "%02X".format(it) }
+            val pktInfo = "cmd=0x${frame.command.toString(16)} t=${frame.type.id} [$hex]"
+            Log.i(TAG, "Incoming glasses event: $pktInfo")
+            _state.value = _state.value.copy(lastIncomingPacket = pktInfo)
+        }
+
         when (frame.command) {
             TuneBudsProtocol.CMD_WIFI_STATE -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
                 TuneBudsProtocol.parseStatus(frame.payload)?.let { value ->
@@ -564,22 +573,25 @@ class TuneBudsManager private constructor(context: Context) {
             TuneBudsProtocol.INFO_IN_EAR_STATE -> TuneBudsProtocol.parseSupportFlag(frame.payload)?.let { enabled ->
                 _state.value = _state.value.copy(inEarDetectionEnabled = enabled, lastError = null)
             }
-            // ВАЖНО: ловим только входящие уведомления от очков, а не RESPONSE на наши же запросы
             TuneBudsProtocol.CMD_AI_CHAT_STATE,
             TuneBudsProtocol.CMD_AI_RECORD_STATE,
-            TuneBudsProtocol.CMD_AI_ENVELOPE -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
+            TuneBudsProtocol.CMD_AI_ENVELOPE -> if (frame.type != TuneBudsFrameType.RESPONSE) {
                 val aiState = TuneBudsProtocol.parseStatus(frame.payload)
-                Log.i(TAG, "AI event cmd=0x${frame.command.toString(16)} state=$aiState len=${frame.payload.size}")
                 if (frame.command == TuneBudsProtocol.CMD_AI_CHAT_STATE && aiState != null) {
                     _state.value = _state.value.copy(lastAiChatState = aiState)
                 }
-                _aiEvents.tryEmit(
-                    TuneBudsAiEvent(
-                        command = frame.command,
-                        state = aiState,
-                        rawPayload = frame.payload.copyOf(),
-                    ),
-                )
+                // Отсекаем стартовый handshake-пакет в первые 5 сек после подключения
+                val readyForAiTrigger = connectedAtMs > 0L &&
+                    (System.currentTimeMillis() - connectedAtMs) > CONNECT_GRACE_MS
+                if (readyForAiTrigger) {
+                    _aiEvents.tryEmit(
+                        TuneBudsAiEvent(
+                            command = frame.command,
+                            state = aiState,
+                            rawPayload = frame.payload.copyOf(),
+                        ),
+                    )
+                }
             }
             TuneBudsProtocol.CMD_AI_PICTURE -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
                 handleAiPicture(frame.payload)
