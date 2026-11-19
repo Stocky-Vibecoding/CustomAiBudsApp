@@ -8,17 +8,24 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.media.ThumbnailUtils
+import android.graphics.SurfaceTexture
+import android.media.MediaMetadataRetriever
+import android.media.MediaPlayer
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
-import android.provider.MediaStore
+import android.view.Surface
+import android.view.TextureView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -30,6 +37,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -39,6 +47,7 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -48,11 +57,16 @@ import androidx.compose.material.icons.filled.BatteryStd
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.BluetoothConnected
 import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.DirectionsCar
+import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
@@ -84,10 +98,13 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -98,18 +115,22 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.fersaiyan.cyanbridge.ai.CarModeAudioManager
 import com.fersaiyan.cyanbridge.ai.GeminiConfig
 import com.fersaiyan.cyanbridge.ai.GeminiGlassAssistant
 import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsManager
+import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsProtocol
 import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsState
 import com.fersaiyan.cyanbridge.media.ColorPreset
 import com.fersaiyan.cyanbridge.media.MediaProcessingOptions
@@ -190,7 +211,6 @@ private fun AiBudsRootScreen(
     val carModeEnabled by carMode.isCarModeEnabled.collectAsState()
     val carModeStatus by carMode.statusMessage.collectAsState()
 
-    // Автообновление статусов очков каждые 15 секунд, пока подключены и не идёт запись
     LaunchedEffect(glassState.protocolState) {
         if (glassState.protocolState == "CONNECTED") {
             while (isActive) {
@@ -217,7 +237,7 @@ private fun AiBudsRootScreen(
                         Icon(Icons.Default.Refresh, contentDescription = "Обновить")
                     }
                     IconButton(onClick = { showSettingsSheet = true }) {
-                        Icon(Icons.Default.Settings, contentDescription = "Настройки и ИИ")
+                        Icon(Icons.Default.Settings, contentDescription = "Настройки")
                     }
                 },
             )
@@ -261,10 +281,15 @@ private fun AiBudsRootScreen(
     }
 
     if (showSettingsSheet) {
-        ModalBottomSheet(onDismissRequest = { showSettingsSheet = false }) {
-            AiSettingsSheetContent(
+        val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        ModalBottomSheet(
+            onDismissRequest = { showSettingsSheet = false },
+            sheetState = sheetState,
+        ) {
+            SettingsSheetContent(
                 gemini = gemini,
                 tuneBuds = tuneBuds,
+                glassState = glassState,
             )
         }
     }
@@ -315,7 +340,7 @@ private fun DeviceTab(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = activeName ?: state.model ?: "Smart Glasses",
+                                text = activeName ?: state.model ?: "AI Glasses",
                                 style = MaterialTheme.typography.titleLarge,
                                 fontWeight = FontWeight.Bold,
                             )
@@ -530,42 +555,6 @@ private fun DeviceTab(
                     }
                 }
             }
-
-            // Жесты тачпада (правая дужка)
-            Card(
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                shape = RoundedCornerShape(18.dp),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("Жесты тачпада (правая дужка)", fontWeight = FontWeight.SemiBold)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        OutlinedButton(
-                            onClick = {
-                                tuneBuds.applyTouchpadPreset(0)
-                                Toast.makeText(context, "Применено: 1-Пауза, 2-След, 3-Пред", Toast.LENGTH_SHORT).show()
-                            },
-                            modifier = Modifier.weight(1f),
-                            shape = RoundedCornerShape(12.dp),
-                        ) {
-                            Text("1-Пауза / 2-След / 3-Пред", maxLines = 1)
-                        }
-                        OutlinedButton(
-                            onClick = {
-                                tuneBuds.applyTouchpadPreset(1)
-                                Toast.makeText(context, "Применено: 1-Нет, 2-Пауза, 3-След", Toast.LENGTH_SHORT).show()
-                            },
-                            modifier = Modifier.weight(1f),
-                            shape = RoundedCornerShape(12.dp),
-                        ) {
-                            Text("Завод", maxLines = 1)
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -590,7 +579,7 @@ private fun DeviceTab(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .clickable {
-                                        val name = device.name ?: "TuneBuds"
+                                        val name = device.name ?: "AI Glasses"
                                         prefs.edit()
                                             .putString("last_mac", device.address)
                                             .putString("last_name", name)
@@ -653,7 +642,7 @@ private fun CarModeCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
                     Icon(Icons.Default.DirectionsCar, contentDescription = null)
                     Spacer(Modifier.width(10.dp))
                     Column {
@@ -702,7 +691,7 @@ private fun WearDetectCard(
                 Column {
                     Text("Датчик снятия очков", fontWeight = FontWeight.SemiBold)
                     Text(
-                        "Автопауза при снятии (0x26)",
+                        "Автопауза при снятии",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -713,7 +702,7 @@ private fun WearDetectCard(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
     val context = LocalContext.current
@@ -724,9 +713,13 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
 
     var files by remember { mutableStateOf<List<File>>(emptyList()) }
     var selectedFile by remember { mutableStateOf<File?>(null) }
+    var selectedPaths by remember { mutableStateOf<Set<String>>(emptySet()) }
     var options by remember { mutableStateOf(MediaProcessingOptions()) }
     var exportProgress by remember { mutableStateOf<Int?>(null) }
     var showFormatDialog by remember { mutableStateOf(false) }
+    var showDeleteSelectedDialog by remember { mutableStateOf(false) }
+
+    val selectionMode = selectedPaths.isNotEmpty()
 
     fun reloadFiles() {
         val dirs = listOfNotNull(
@@ -741,6 +734,7 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
                 .toList()
         }.distinctBy { it.absolutePath }
             .sortedByDescending { it.lastModified() }
+        selectedPaths = selectedPaths.intersect(files.map { it.absolutePath }.toSet())
     }
 
     LaunchedEffect(Unit) { reloadFiles() }
@@ -752,89 +746,141 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
         val columns = if (maxWidth >= 600.dp) 4 else 2
 
         Column(modifier = Modifier.fillMaxSize()) {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 10.dp),
-            ) {
-                Column(
+            if (selectionMode) {
+                // Панель массового удаления выбранных файлов
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)),
+                    shape = RoundedCornerShape(14.dp),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
                 ) {
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text(
-                            text = state.mediaCounts?.let {
-                                "На очках: ${it.total} (${it.images} фото, ${it.videos} видео)"
-                            } ?: "Локальные файлы: ${files.size}",
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.Medium,
-                        )
-                        IconButton(onClick = { reloadFiles() }, modifier = Modifier.size(28.dp)) {
-                            Icon(Icons.Default.Refresh, contentDescription = "Обновить список")
-                        }
-                    }
-
-                    Text(
-                        text = importState.error ?: importState.statusText,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (importState.error != null) {
-                            MaterialTheme.colorScheme.error
-                        } else {
-                            MaterialTheme.colorScheme.secondary
-                        },
-                    )
-
-                    if (importState.isRunning) {
-                        if (importState.totalFiles > 0) {
-                            LinearProgressIndicator(
-                                progress = { (importState.currentFilePercent / 100f).coerceIn(0f, 1f) },
-                                modifier = Modifier.fillMaxWidth(),
-                            )
-                        } else {
-                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                        }
-                    }
-
-                    Button(
-                        onClick = {
-                            scope.launch {
-                                importer.startImport(tuneBuds)
-                                reloadFiles()
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            IconButton(onClick = { selectedPaths = emptySet() }) {
+                                Icon(Icons.Default.Close, contentDescription = "Отмена")
                             }
-                        },
-                        enabled = !importState.isRunning,
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(12.dp),
-                    ) {
-                        if (importState.isRunning) {
-                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                        } else {
-                            Icon(Icons.Default.Download, contentDescription = null)
+                            Text(
+                                text = "Выбрано: ${selectedPaths.size}",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.SemiBold,
+                            )
                         }
-                        Spacer(Modifier.width(8.dp))
-                        Text(if (importState.isRunning) "Идёт перенос по Wi-Fi..." else "Импорт с очков (Wi-Fi)")
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            IconButton(
+                                onClick = {
+                                    selectedPaths = if (selectedPaths.size == files.size) {
+                                        emptySet()
+                                    } else {
+                                        files.map { it.absolutePath }.toSet()
+                                    }
+                                },
+                            ) {
+                                Icon(Icons.Default.DoneAll, contentDescription = "Выбрать все")
+                            }
+                            Button(
+                                onClick = { showDeleteSelectedDialog = true },
+                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                shape = RoundedCornerShape(10.dp),
+                            ) {
+                                Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("Удалить")
+                            }
+                        }
                     }
-
-                    OutlinedButton(
-                        onClick = { showFormatDialog = true },
-                        enabled = !importState.isRunning && state.protocolState == "CONNECTED",
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = ButtonDefaults.outlinedButtonColors(
-                            contentColor = MaterialTheme.colorScheme.error,
-                        ),
+                }
+            } else {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        Icon(Icons.Default.DeleteForever, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Очистить память очков")
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = state.mediaCounts?.let {
+                                    "На очках: ${it.total} (${it.images} фото, ${it.videos} видео)"
+                                } ?: "Локальные файлы: ${files.size}",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            IconButton(onClick = { reloadFiles() }, modifier = Modifier.size(28.dp)) {
+                                Icon(Icons.Default.Refresh, contentDescription = "Обновить список")
+                            }
+                        }
+
+                        Text(
+                            text = importState.error ?: importState.statusText,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (importState.error != null) {
+                                MaterialTheme.colorScheme.error
+                            } else {
+                                MaterialTheme.colorScheme.secondary
+                            },
+                        )
+
+                        if (importState.isRunning) {
+                            if (importState.totalFiles > 0) {
+                                LinearProgressIndicator(
+                                    progress = { (importState.currentFilePercent / 100f).coerceIn(0f, 1f) },
+                                    modifier = Modifier.fillMaxWidth(),
+                                )
+                            } else {
+                                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                            }
+                        }
+
+                        Button(
+                            onClick = {
+                                scope.launch {
+                                    importer.startImport(tuneBuds)
+                                    reloadFiles()
+                                }
+                            },
+                            enabled = !importState.isRunning,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                        ) {
+                            if (importState.isRunning) {
+                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                            } else {
+                                Icon(Icons.Default.Download, contentDescription = null)
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            Text(if (importState.isRunning) "Идёт перенос по Wi-Fi..." else "Импорт с очков (Wi-Fi)")
+                        }
+
+                        OutlinedButton(
+                            onClick = { showFormatDialog = true },
+                            enabled = !importState.isRunning && state.protocolState == "CONNECTED",
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                contentColor = MaterialTheme.colorScheme.error,
+                            ),
+                        ) {
+                            Icon(Icons.Default.DeleteForever, contentDescription = null)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Очистить память очков")
+                        }
                     }
                 }
             }
@@ -855,36 +901,116 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
                     modifier = Modifier.fillMaxSize(),
                 ) {
                     items(files, key = { it.absolutePath }) { file ->
-                        MediaGridTile(file = file, onClick = { selectedFile = file })
+                        val isSelected = file.absolutePath in selectedPaths
+                        MediaGridTile(
+                            file = file,
+                            selectionMode = selectionMode,
+                            isSelected = isSelected,
+                            onClick = {
+                                if (selectionMode) {
+                                    selectedPaths = if (isSelected) {
+                                        selectedPaths - file.absolutePath
+                                    } else {
+                                        selectedPaths + file.absolutePath
+                                    }
+                                } else {
+                                    selectedFile = file
+                                }
+                            },
+                            onLongClick = {
+                                selectedPaths = if (isSelected) {
+                                    selectedPaths - file.absolutePath
+                                } else {
+                                    selectedPaths + file.absolutePath
+                                }
+                            },
+                        )
                     }
                 }
             }
         }
     }
 
+    // Шторка предпросмотра и экспорта фото/видео
     selectedFile?.let { file ->
-        ModalBottomSheet(onDismissRequest = { if (exportProgress == null) selectedFile = null }) {
+        val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        ModalBottomSheet(
+            onDismissRequest = { if (exportProgress == null) selectedFile = null },
+            sheetState = sheetState,
+        ) {
+            val isVideo = file.extension.equals("mp4", ignoreCase = true)
+            var showOriginalPreview by remember(file.absolutePath) { mutableStateOf(false) }
+
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 12.dp),
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 20.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Text(
-                    text = file.name,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = file.name,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    IconButton(
+                        onClick = {
+                            if (exportProgress == null) {
+                                file.delete()
+                                selectedFile = null
+                                reloadFiles()
+                                Toast.makeText(context, "Файл удалён", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                    ) {
+                        Icon(Icons.Default.Delete, contentDescription = "Удалить", tint = MaterialTheme.colorScheme.error)
+                    }
+                }
+
+                // Предпросмотр видео или фото
+                if (isVideo) {
+                    InlineVideoPlayer(
+                        file = file,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 200.dp, max = 300.dp),
+                    )
+                } else {
+                    PhotoLivePreview(
+                        file = file,
+                        preset = if (showOriginalPreview) ColorPreset.entries.first() else options.colorPreset,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 200.dp, max = 300.dp),
+                    )
+                    if (options.colorPreset != ColorPreset.entries.first()) {
+                        TextButton(
+                            onClick = { showOriginalPreview = !showOriginalPreview },
+                            modifier = Modifier.align(Alignment.End),
+                        ) {
+                            Text(if (showOriginalPreview) "Показать с обработкой" else "Сравнить с оригиналом")
+                        }
+                    }
+                }
 
                 Text("Цветокоррекция", style = MaterialTheme.typography.labelLarge)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                     ColorPreset.entries.forEach { preset ->
                         FilterChip(
                             selected = options.colorPreset == preset,
-                            onClick = { options = options.copy(colorPreset = preset) },
-                            label = { Text(preset.label) },
+                            onClick = {
+                                showOriginalPreview = false
+                                options = options.copy(colorPreset = preset)
+                            },
+                            label = { Text(preset.label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                             modifier = Modifier.weight(1f),
                         )
                     }
@@ -898,7 +1024,7 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
                     Text("Апскейл 2K (2048×1536)")
                 }
 
-                if (file.extension.equals("mp4", ignoreCase = true)) {
+                if (isVideo) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(
                             checked = options.stabilize,
@@ -929,7 +1055,7 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
                         scope.launch {
                             exportProgress = 0
                             runCatching {
-                                if (file.extension.equals("mp4", ignoreCase = true)) {
+                                if (isVideo) {
                                     processor.exportVideoToGallery(file, options) { exportProgress = it }
                                 } else {
                                     processor.exportPhotoToGallery(file, options)
@@ -955,6 +1081,35 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
                 Spacer(Modifier.height(16.dp))
             }
         }
+    }
+
+    if (showDeleteSelectedDialog) {
+        AlertDialog(
+            onDismissRequest = { showDeleteSelectedDialog = false },
+            title = { Text("Удалить выбранные (${selectedPaths.size})?") },
+            text = { Text("Выбранные черновики будут удалены с телефона. Файлы, уже сохранённые в Галерею, не пострадают.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        var deleted = 0
+                        selectedPaths.forEach { path ->
+                            if (File(path).delete()) deleted++
+                        }
+                        selectedPaths = emptySet()
+                        showDeleteSelectedDialog = false
+                        reloadFiles()
+                        Toast.makeText(context, "Удалено файлов: $deleted", Toast.LENGTH_SHORT).show()
+                    },
+                ) {
+                    Text("Удалить", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteSelectedDialog = false }) {
+                    Text("Отмена")
+                }
+            },
+        )
     }
 
     if (showFormatDialog) {
@@ -983,17 +1138,185 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
 }
 
 @Composable
-private fun MediaGridTile(file: File, onClick: () -> Unit) {
+private fun InlineVideoPlayer(file: File, modifier: Modifier = Modifier) {
+    var isPlaying by remember(file.absolutePath) { mutableStateOf(true) }
+    var videoRatio by remember(file.absolutePath) { mutableFloatStateOf(16f / 9f) }
+    var playerRef by remember(file.absolutePath) { mutableStateOf<MediaPlayer?>(null) }
+
+    DisposableEffect(file.absolutePath) {
+        onDispose {
+            runCatching {
+                playerRef?.stop()
+                playerRef?.release()
+            }
+            playerRef = null
+        }
+    }
+
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color.Black)
+            .clickable {
+                val mp = playerRef ?: return@clickable
+                runCatching {
+                    if (mp.isPlaying) {
+                        mp.pause()
+                        isPlaying = false
+                    } else {
+                        mp.start()
+                        isPlaying = true
+                    }
+                }
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        AndroidView(
+            factory = { ctx ->
+                TextureView(ctx).apply {
+                    var activeSurface: Surface? = null
+                    surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                        override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+                            runCatching {
+                                val surface = Surface(st)
+                                activeSurface = surface
+                                val mp = MediaPlayer().apply {
+                                    setDataSource(file.absolutePath)
+                                    setSurface(surface)
+                                    isLooping = true
+                                    setOnVideoSizeChangedListener { _, vw, vh ->
+                                        if (vw > 0 && vh > 0) {
+                                            videoRatio = vw.toFloat() / vh.toFloat()
+                                        }
+                                    }
+                                    setOnPreparedListener {
+                                        start()
+                                        isPlaying = true
+                                    }
+                                    prepareAsync()
+                                }
+                                playerRef = mp
+                            }
+                        }
+
+                        override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) = Unit
+
+                        override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                            runCatching {
+                                playerRef?.stop()
+                                playerRef?.release()
+                            }
+                            playerRef = null
+                            runCatching { activeSurface?.release() }
+                            activeSurface = null
+                            return true
+                        }
+
+                        override fun onSurfaceTextureUpdated(st: SurfaceTexture) = Unit
+                    }
+                }
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(videoRatio.coerceIn(0.6f, 2.2f)),
+        )
+
+        if (!isPlaying) {
+            Box(
+                modifier = Modifier
+                    .size(52.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.65f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(Icons.Default.PlayArrow, contentDescription = "Воспроизвести", tint = Color.White)
+            }
+        }
+    }
+}
+
+@Composable
+private fun PhotoLivePreview(
+    file: File,
+    preset: ColorPreset,
+    modifier: Modifier = Modifier,
+) {
+    val bmp by produceState<Bitmap?>(initialValue = null, key1 = file.absolutePath) {
+        value = withContext(Dispatchers.IO) {
+            runCatching {
+                val opts = BitmapFactory.Options().apply { inSampleSize = 2 }
+                BitmapFactory.decodeFile(file.absolutePath, opts)
+            }.getOrNull()
+        }
+    }
+
+    val colorFilter = remember(preset) {
+        val idx = ColorPreset.entries.indexOf(preset)
+        when (idx) {
+            1 -> ColorFilter.colorMatrix(
+                ColorMatrix(
+                    floatArrayOf(
+                        1.06f, 0f, 0f, 0f, 2f,
+                        0f, 1.05f, 0f, 0f, 1f,
+                        0f, 0f, 1.03f, 0f, 0f,
+                        0f, 0f, 0f, 1f, 0f,
+                    ),
+                ),
+            )
+            2 -> ColorFilter.colorMatrix(
+                ColorMatrix(
+                    floatArrayOf(
+                        1.05f, 0f, 0f, 0f, 8f,
+                        0f, 1.05f, 0f, 0f, 8f,
+                        0f, 0f, 1.05f, 0f, 8f,
+                        0f, 0f, 0f, 1f, 0f,
+                    ),
+                ),
+            )
+            else -> null
+        }
+    }
+
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color.Black),
+        contentAlignment = Alignment.Center,
+    ) {
+        bmp?.let { image ->
+            Image(
+                bitmap = image.asImageBitmap(),
+                contentDescription = file.name,
+                contentScale = ContentScale.Fit,
+                colorFilter = colorFilter,
+                modifier = Modifier.fillMaxSize(),
+            )
+        } ?: CircularProgressIndicator(modifier = Modifier.size(28.dp))
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun MediaGridTile(
+    file: File,
+    selectionMode: Boolean,
+    isSelected: Boolean,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+) {
     val isVideo = file.extension.equals("mp4", ignoreCase = true)
     val thumb by produceState<Bitmap?>(initialValue = null, key1 = file.absolutePath) {
         value = withContext(Dispatchers.IO) {
             runCatching {
                 if (isVideo) {
-                    @Suppress("DEPRECATION")
-                    ThumbnailUtils.createVideoThumbnail(
-                        file.absolutePath,
-                        MediaStore.Images.Thumbnails.MINI_KIND,
-                    )
+                    val mmr = MediaMetadataRetriever()
+                    try {
+                        mmr.setDataSource(file.absolutePath)
+                        mmr.getFrameAtTime(500_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                            ?: mmr.getFrameAtTime(0L)
+                    } finally {
+                        runCatching { mmr.release() }
+                    }
                 } else {
                     val opts = BitmapFactory.Options().apply { inSampleSize = 4 }
                     BitmapFactory.decodeFile(file.absolutePath, opts)
@@ -1008,7 +1331,17 @@ private fun MediaGridTile(file: File, onClick: () -> Unit) {
             .aspectRatio(4f / 3f)
             .clip(RoundedCornerShape(14.dp))
             .background(MaterialTheme.colorScheme.surfaceVariant)
-            .clickable(onClick = onClick),
+            .then(
+                if (isSelected) {
+                    Modifier.border(BorderStroke(3.dp, MaterialTheme.colorScheme.primary), RoundedCornerShape(14.dp))
+                } else {
+                    Modifier
+                },
+            )
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongClick,
+            ),
     ) {
         thumb?.let { bmp ->
             Image(
@@ -1018,6 +1351,22 @@ private fun MediaGridTile(file: File, onClick: () -> Unit) {
                 modifier = Modifier.fillMaxSize(),
             )
         }
+
+        if (selectionMode) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(6.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Default.CheckCircle,
+                    contentDescription = null,
+                    tint = if (isSelected) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.5f),
+                    modifier = Modifier.size(24.dp),
+                )
+            }
+        }
+
         if (isVideo) {
             Box(
                 modifier = Modifier
@@ -1027,16 +1376,17 @@ private fun MediaGridTile(file: File, onClick: () -> Unit) {
                     .background(Color.Black.copy(alpha = 0.65f))
                     .padding(horizontal = 6.dp, vertical = 2.dp),
             ) {
-                Text("VIDEO", style = MaterialTheme.typography.labelSmall, color = Color.White)
+                Text("ВИДЕО", style = MaterialTheme.typography.labelSmall, color = Color.White)
             }
         }
     }
 }
 
 @Composable
-private fun AiSettingsSheetContent(
+private fun SettingsSheetContent(
     gemini: GeminiGlassAssistant,
     tuneBuds: TuneBudsManager,
+    glassState: TuneBudsState,
 ) {
     val context = LocalContext.current
     val cfg by gemini.config.collectAsState()
@@ -1055,10 +1405,69 @@ private fun AiSettingsSheetContent(
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
             .padding(horizontal = 20.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        Text("Настройки Gemini и ИИ", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+        Text("Настройки", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+
+        // Раздел 1: Жесты тачпада (перенесён с главного экрана)
+        Text("Управление тачпадом", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedButton(
+                onClick = { tuneBuds.applyTouchpadPreset(0) },
+                enabled = glassState.protocolState == "CONNECTED",
+                modifier = Modifier.weight(1f),
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Text("Удобный", maxLines = 1)
+            }
+            OutlinedButton(
+                onClick = { tuneBuds.applyTouchpadPreset(1) },
+                enabled = glassState.protocolState == "CONNECTED",
+                modifier = Modifier.weight(1f),
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Text("Заводской", maxLines = 1)
+            }
+        }
+        Text(
+            text = "Удобный: 1× Пауза, 2× След. трек, 3× Пред. трек\nЗаводской: 1× Выкл, 2× Пауза, 3× След. трек",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        glassState.gestureStatus?.let { st ->
+            Text(
+                text = st,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.secondary,
+            )
+        }
+
+        // Тонкая настройка 1× тапа отдельно
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("Одинарный тап:", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+            TextButton(
+                onClick = { tuneBuds.setTapGesture(1, TuneBudsProtocol.KEY_FUNC_PLAY_PAUSE) },
+                enabled = glassState.protocolState == "CONNECTED",
+            ) { Text("Пауза") }
+            TextButton(
+                onClick = { tuneBuds.setTapGesture(1, TuneBudsProtocol.KEY_FUNC_NONE) },
+                enabled = glassState.protocolState == "CONNECTED",
+            ) { Text("Выкл") }
+        }
+
+        HorizontalDivider()
+
+        // Раздел 2: Настройки Gemini
+        Text("Ассистент Gemini", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
 
         OutlinedTextField(
             value = apiKey,
@@ -1095,7 +1504,7 @@ private fun AiSettingsSheetContent(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text("Фото с очков при удержании дужки")
+            Text("Всегда делать фото при удержании")
             Switch(checked = autoVision, onCheckedChange = { autoVision = it })
         }
 
@@ -1119,7 +1528,7 @@ private fun AiSettingsSheetContent(
         }
 
         Text(
-            text = "Диагностика дужки: $templeLog",
+            text = "Статус дужки: $templeLog",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.secondary,
         )
@@ -1179,6 +1588,6 @@ private fun AiSettingsSheetContent(
             }
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(20.dp))
     }
 }
