@@ -128,6 +128,7 @@ import com.fersaiyan.cyanbridge.ai.CarModeAudioManager
 import com.fersaiyan.cyanbridge.ai.GeminiConfig
 import com.fersaiyan.cyanbridge.ai.GeminiGlassAssistant
 import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsManager
+import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsProtocol
 import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsState
 import com.fersaiyan.cyanbridge.media.ColorPreset
 import com.fersaiyan.cyanbridge.media.MediaProcessingOptions
@@ -1475,6 +1476,22 @@ private fun SettingsSheetContent(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        if (glassState.keySettings.isNotEmpty()) {
+            val single = glassState.keySettings[TuneBudsProtocol.KEY_RIGHT_SINGLE]
+                ?: glassState.keySettings[TuneBudsProtocol.KEY_LEFT_SINGLE]
+            val dbl = glassState.keySettings[TuneBudsProtocol.KEY_RIGHT_DOUBLE]
+                ?: glassState.keySettings[TuneBudsProtocol.KEY_LEFT_DOUBLE]
+            val triple = glassState.keySettings[TuneBudsProtocol.KEY_RIGHT_TRIPLE]
+                ?: glassState.keySettings[TuneBudsProtocol.KEY_LEFT_TRIPLE]
+            Text(
+                text = "Сейчас на очках: " +
+                    "1× ${single?.let(TuneBudsProtocol::keyFunctionLabel) ?: "—"}, " +
+                    "2× ${dbl?.let(TuneBudsProtocol::keyFunctionLabel) ?: "—"}, " +
+                    "3× ${triple?.let(TuneBudsProtocol::keyFunctionLabel) ?: "—"}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.secondary,
+            )
+        }
         glassState.gestureStatus?.let { st ->
             Text(
                 text = st,
@@ -1550,13 +1567,6 @@ private fun SettingsSheetContent(
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.secondary,
         )
-        glassState.lastIncomingPacket?.let { pkt ->
-            Text(
-                text = "Пакет очков: $pkt",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
 
         HorizontalDivider()
 
