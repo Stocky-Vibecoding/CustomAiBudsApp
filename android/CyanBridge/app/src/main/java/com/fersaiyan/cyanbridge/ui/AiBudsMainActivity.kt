@@ -113,6 +113,7 @@ import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsState
 import com.fersaiyan.cyanbridge.media.ColorPreset
 import com.fersaiyan.cyanbridge.media.MediaProcessingOptions
 import com.fersaiyan.cyanbridge.media.MetaVideoProcessor
+import com.fersaiyan.cyanbridge.media.TuneBudsWifiImporter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -122,14 +123,19 @@ class AiBudsMainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val missing = listOf(
-                Manifest.permission.BLUETOOTH_CONNECT,
-                Manifest.permission.BLUETOOTH_SCAN,
-            ).filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
-            if (missing.isNotEmpty()) {
-                ActivityCompat.requestPermissions(this, missing.toTypedArray(), 101)
+        val perms = buildList {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                add(Manifest.permission.BLUETOOTH_CONNECT)
+                add(Manifest.permission.BLUETOOTH_SCAN)
             }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                add(Manifest.permission.NEARBY_WIFI_DEVICES)
+            }
+            add(Manifest.permission.ACCESS_FINE_LOCATION)
+        }.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
+
+        if (perms.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, perms.toTypedArray(), 101)
         }
 
         val tuneBuds = TuneBudsManager.getInstance(applicationContext)
@@ -223,7 +229,7 @@ private fun AiBudsRootScreen(
                     onOpenAiSheet = { showSettingsSheet = true },
                 )
             } else {
-                MediaTab(state = glassState)
+                MediaTab(state = glassState, tuneBuds = tuneBuds)
             }
         }
     }
@@ -258,6 +264,7 @@ private fun DeviceTab(
     val savedMac = remember { prefs.getString("last_mac", null) }
     val savedName = remember { prefs.getString("last_name", null) }
     val isConnected = state.protocolState == "CONNECTED"
+    val activeName = state.deviceName ?: savedName
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val isWide = maxWidth >= 600.dp
@@ -269,7 +276,6 @@ private fun DeviceTab(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            // Карточка очков
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                 shape = RoundedCornerShape(20.dp),
@@ -283,7 +289,7 @@ private fun DeviceTab(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = state.deviceName ?: state.model ?: savedName ?: "Smart Glasses",
+                                text = activeName ?: state.model ?: "Smart Glasses",
                                 style = MaterialTheme.typography.titleLarge,
                                 fontWeight = FontWeight.Bold,
                             )
@@ -312,7 +318,6 @@ private fun DeviceTab(
                         }
                     }
 
-                    // Кнопка подключения / отключения очков
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -391,7 +396,6 @@ private fun DeviceTab(
                 }
             }
 
-            // Быстрые действия: Фото / Видео / Gemini Vision
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -448,13 +452,12 @@ private fun DeviceTab(
                 Text(if (geminiBusy) "Gemini анализирует кадр..." else "Спросить Gemini по фото с очков")
             }
 
-            // Сетка тумблеров (адаптивная под Fold)
             if (isWide) {
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
                     CarModeCard(
                         enabled = carModeEnabled,
                         status = carModeStatus,
-                        onToggle = { carMode.setCarMode(it, state.deviceAddress) },
+                        onToggle = { carMode.setCarMode(it, state.deviceAddress, activeName) },
                         modifier = Modifier.weight(1f),
                     )
                     WearDetectCard(
@@ -467,7 +470,7 @@ private fun DeviceTab(
                 CarModeCard(
                     enabled = carModeEnabled,
                     status = carModeStatus,
-                    onToggle = { carMode.setCarMode(it, state.deviceAddress) },
+                    onToggle = { carMode.setCarMode(it, state.deviceAddress, activeName) },
                     modifier = Modifier.fillMaxWidth(),
                 )
                 WearDetectCard(
@@ -477,7 +480,6 @@ private fun DeviceTab(
                 )
             }
 
-            // Лимит длительности видео
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                 shape = RoundedCornerShape(18.dp),
@@ -491,8 +493,9 @@ private fun DeviceTab(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         options.forEach { (sec, label) ->
+                            val isSelected = state.videoLimitSeconds == sec || state.videoLimitSeconds == (sec / 60)
                             FilterChip(
-                                selected = state.videoLimitSeconds == sec,
+                                selected = isSelected,
                                 onClick = { tuneBuds.setVideoLimit(sec) },
                                 label = { Text(label) },
                                 modifier = Modifier.weight(1f),
@@ -555,8 +558,6 @@ private fun DeviceTab(
                             context.startActivity(
                                 Intent().setClassName(context, "com.fersaiyan.cyanbridge.ui.DeviceBindActivity"),
                             )
-                        }.onFailure {
-                            Toast.makeText(context, "Открой ярлык CyanBridge для сканирования", Toast.LENGTH_SHORT).show()
                         }
                     },
                 ) {
@@ -652,10 +653,12 @@ private fun WearDetectCard(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun MediaTab(state: TuneBudsState) {
+private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val processor = remember { MetaVideoProcessor(context.applicationContext) }
+    val importer = remember { TuneBudsWifiImporter.getInstance(context.applicationContext) }
+    val importState by importer.state.collectAsState()
 
     var files by remember { mutableStateOf<List<File>>(emptyList()) }
     var selectedFile by remember { mutableStateOf<File?>(null) }
@@ -664,6 +667,7 @@ private fun MediaTab(state: TuneBudsState) {
 
     fun reloadFiles() {
         val dirs = listOfNotNull(
+            importer.getMediaDir(),
             context.getExternalFilesDir(Environment.DIRECTORY_PICTURES),
             context.getExternalFilesDir(Environment.DIRECTORY_MOVIES),
             context.getExternalFilesDir(null),
@@ -682,7 +686,6 @@ private fun MediaTab(state: TuneBudsState) {
         val columns = if (maxWidth >= 600.dp) 4 else 2
 
         Column(modifier = Modifier.fillMaxSize()) {
-            // Плашка статуса медиа и кнопка импорта с очков
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
                 shape = RoundedCornerShape(14.dp),
@@ -694,7 +697,7 @@ private fun MediaTab(state: TuneBudsState) {
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -706,31 +709,52 @@ private fun MediaTab(state: TuneBudsState) {
                                 "На очках: ${it.total} (${it.images} фото, ${it.videos} видео)"
                             } ?: "Локальные файлы: ${files.size}",
                             style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium,
                         )
                         IconButton(onClick = { reloadFiles() }, modifier = Modifier.size(28.dp)) {
                             Icon(Icons.Default.Refresh, contentDescription = "Обновить список")
                         }
                     }
 
+                    Text(
+                        text = importState.error ?: importState.statusText,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (importState.error != null) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.secondary
+                        },
+                    )
+
+                    if (importState.isRunning) {
+                        if (importState.totalFiles > 0) {
+                            LinearProgressIndicator(
+                                progress = { (importState.currentFilePercent / 100f).coerceIn(0f, 1f) },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        } else {
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        }
+                    }
+
                     Button(
                         onClick = {
-                            runCatching {
-                                context.startActivity(
-                                    Intent().setClassName(
-                                        context,
-                                        "com.fersaiyan.cyanbridge.ui.recordings.SyncedMediaGalleryActivity",
-                                    ),
-                                )
-                            }.onFailure {
-                                Toast.makeText(context, "Не удалось открыть экран импорта", Toast.LENGTH_SHORT).show()
+                            scope.launch {
+                                importer.startImport(tuneBuds)
+                                reloadFiles()
                             }
                         },
+                        enabled = !importState.isRunning,
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(12.dp),
                     ) {
-                        Icon(Icons.Default.Download, contentDescription = null)
+                        if (importState.isRunning) {
+                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        } else {
+                            Icon(Icons.Default.Download, contentDescription = null)
+                        }
                         Spacer(Modifier.width(8.dp))
-                        Text("Импорт с очков (Wi-Fi)")
+                        Text(if (importState.isRunning) "Идёт перенос по Wi-Fi..." else "Импорт с очков (Wi-Fi)")
                     }
                 }
             }
@@ -910,6 +934,7 @@ private fun AiSettingsSheetContent(
     gemini: GeminiGlassAssistant,
     tuneBuds: TuneBudsManager,
 ) {
+    val context = LocalContext.current
     val cfg by gemini.config.collectAsState()
     val messages by gemini.messages.collectAsState()
     val templeLog by gemini.lastTempleLog.collectAsState()
@@ -981,6 +1006,7 @@ private fun AiSettingsSheetContent(
                         autoVisionOnTempleHold = autoVision,
                     ),
                 )
+                Toast.makeText(context, "Настройки ИИ сохранены!", Toast.LENGTH_SHORT).show()
             },
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(12.dp),
