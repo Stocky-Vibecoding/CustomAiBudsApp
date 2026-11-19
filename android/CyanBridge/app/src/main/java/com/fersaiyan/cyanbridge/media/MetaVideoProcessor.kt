@@ -4,11 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.Canvas
-import android.graphics.ColorMatrix
-import android.graphics.ColorMatrixColorFilter
 import android.graphics.Matrix
-import android.graphics.Paint
 import android.media.Image
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -16,6 +12,7 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.opengl.GLES20
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
@@ -24,13 +21,14 @@ import androidx.annotation.OptIn
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.VideoFrameProcessingException
+import androidx.media3.common.util.Size
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.effect.Brightness
-import androidx.media3.effect.Contrast
-import androidx.media3.effect.HslAdjustment
+import androidx.media3.effect.BaseGlShaderProgram
+import androidx.media3.effect.GlEffect
+import androidx.media3.effect.GlShaderProgram
 import androidx.media3.effect.MatrixTransformation
 import androidx.media3.effect.Presentation
-import androidx.media3.effect.RgbAdjustment
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.DefaultEncoderFactory
 import androidx.media3.transformer.EditedMediaItem
@@ -53,16 +51,22 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.FloatBuffer
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.math.abs
 import kotlin.math.exp
+import kotlin.math.hypot
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.tanh
 
 enum class ColorPreset(val label: String) {
     ORIGINAL("Оригинал"),
-    META_DAY("Чистый день"),
-    NIGHT_CAR("Вечер / Авто"),
+    META_DAY("Кино / День"),
+    NIGHT_CAR("Ночь / Авто"),
 }
 
 data class MediaProcessingOptions(
@@ -73,6 +77,32 @@ data class MediaProcessingOptions(
 ) {
     val requiresVideoReencode: Boolean
         get() = colorPreset != ColorPreset.ORIGINAL || upscale2K || stabilize
+}
+
+private data class GradeParams(
+    val contrast: Float,
+    val shadowLift: Float,
+    val vibrance: Float,
+    val sharpness: Float,
+    val chromaDenoise: Float,
+)
+
+private fun ColorPreset.toGradeParams(): GradeParams? = when (this) {
+    ColorPreset.ORIGINAL -> null
+    ColorPreset.META_DAY -> GradeParams(
+        contrast = 0.24f,
+        shadowLift = 0.14f,
+        vibrance = 0.22f,
+        sharpness = 0.55f,
+        chromaDenoise = 0.72f,
+    )
+    ColorPreset.NIGHT_CAR -> GradeParams(
+        contrast = 0.16f,
+        shadowLift = 0.34f,
+        vibrance = 0.14f,
+        sharpness = 0.38f,
+        chromaDenoise = 0.90f,
+    )
 }
 
 @OptIn(UnstableApi::class)
@@ -146,7 +176,7 @@ class MetaVideoProcessor(private val context: Context) {
     suspend fun exportPhotoToGallery(
         inputFile: File,
         options: MediaProcessingOptions,
-    ): Uri = withContext(Dispatchers.IO) {
+    ): Uri = withContext(Dispatchers.Default) {
         val tempOut = if (options.colorPreset == ColorPreset.ORIGINAL && !options.upscale2K) {
             null
         } else {
@@ -167,12 +197,14 @@ class MetaVideoProcessor(private val context: Context) {
         }
 
         try {
-            val galleryUri = saveFileToGallery(
-                file = tempOut ?: inputFile,
-                mimeType = "image/jpeg",
-                isVideo = false,
-                displayName = buildOutputName(inputFile.nameWithoutExtension, "jpg", options),
-            )
+            val galleryUri = withContext(Dispatchers.IO) {
+                saveFileToGallery(
+                    file = tempOut ?: inputFile,
+                    mimeType = "image/jpeg",
+                    isVideo = false,
+                    displayName = buildOutputName(inputFile.nameWithoutExtension, "jpg", options),
+                )
+            }
             if (options.deleteDraftAfterSave && inputFile.exists()) {
                 inputFile.delete()
             }
@@ -184,8 +216,12 @@ class MetaVideoProcessor(private val context: Context) {
         }
     }
 
+    /**
+     * Точно тот же конвейер (chroma denoise + CAS luma sharpen + filmic S-curve + smart vibrance),
+     * что и в GPU-шейдере видео. Используется и для фото, и для точного превью «До / После».
+     */
     fun applyPhotoEffects(source: Bitmap, options: MediaProcessingOptions): Bitmap {
-        val targetBitmap = if (options.upscale2K && source.height < 1536) {
+        val working = if (options.upscale2K && source.height < 1536) {
             val scale = 1536f / source.height.toFloat()
             val targetW = (source.width * scale).toInt().coerceAtLeast(1)
             Bitmap.createScaledBitmap(source, targetW, 1536, true)
@@ -193,17 +229,128 @@ class MetaVideoProcessor(private val context: Context) {
             source
         }
 
-        val matrix = buildPhotoColorMatrix(options.colorPreset) ?: return targetBitmap
-        val out = Bitmap.createBitmap(targetBitmap.width, targetBitmap.height, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(out)
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
-            colorFilter = ColorMatrixColorFilter(matrix)
+        val params = options.colorPreset.toGradeParams() ?: return working
+        val w = working.width
+        val h = working.height
+        val size = w * h
+        val pixels = IntArray(size)
+        working.getPixels(pixels, 0, w, 0, 0, w, h)
+
+        val yArr = FloatArray(size)
+        val cbArr = FloatArray(size)
+        val crArr = FloatArray(size)
+        val inv255 = 1f / 255f
+
+        for (i in 0 until size) {
+            val p = pixels[i]
+            val r = ((p ushr 16) and 0xFF) * inv255
+            val g = ((p ushr 8) and 0xFF) * inv255
+            val b = (p and 0xFF) * inv255
+            val y = 0.2126f * r + 0.7152f * g + 0.0722f * b
+            yArr[i] = y
+            cbArr[i] = (b - y) * 0.5389f
+            crArr[i] = (r - y) * 0.6350f
         }
-        canvas.drawBitmap(targetBitmap, 0f, 0f, paint)
-        if (targetBitmap !== source) {
-            targetBitmap.recycle()
+
+        val outPixels = IntArray(size)
+        val sigma = 0.07f
+
+        for (row in 0 until h) {
+            val rowOff = row * w
+            val rowU = max(0, row - 1) * w
+            val rowD = min(h - 1, row + 1) * w
+            val rowU2 = max(0, row - 2) * w
+            val rowD2 = min(h - 1, row + 2) * w
+
+            for (col in 0 until w) {
+                val idx = rowOff + col
+                val colL = max(0, col - 1)
+                val colR = min(w - 1, col + 1)
+                val colL2 = max(0, col - 2)
+                val colR2 = min(w - 1, col + 2)
+
+                val iL = rowOff + colL
+                val iR = rowOff + colR
+                val iU = rowU + col
+                val iD = rowD + col
+                val iL2 = rowOff + colL2
+                val iR2 = rowOff + colR2
+                val iU2 = rowU2 + col
+                val iD2 = rowD2 + col
+
+                val y0 = yArr[idx]
+                val yL = yArr[iL]
+                val yR = yArr[iR]
+                val yU = yArr[iU]
+                val yD = yArr[iD]
+
+                // 1. Билатеральное подавление цветового шума (только Cb/Cr)
+                val w0 = 1.5f
+                val wL = fastWeight(abs(yL - y0) / sigma)
+                val wR = fastWeight(abs(yR - y0) / sigma)
+                val wU = fastWeight(abs(yU - y0) / sigma)
+                val wD = fastWeight(abs(yD - y0) / sigma)
+                val wL2 = fastWeight(abs(yArr[iL2] - y0) / sigma) * 0.7f
+                val wR2 = fastWeight(abs(yArr[iR2] - y0) / sigma) * 0.7f
+                val wU2 = fastWeight(abs(yArr[iU2] - y0) / sigma) * 0.7f
+                val wD2 = fastWeight(abs(yArr[iD2] - y0) / sigma) * 0.7f
+
+                val wSum = w0 + wL + wR + wU + wD + wL2 + wR2 + wU2 + wD2
+                val avgCb = (cbArr[idx] * w0 +
+                    cbArr[iL] * wL + cbArr[iR] * wR + cbArr[iU] * wU + cbArr[iD] * wD +
+                    cbArr[iL2] * wL2 + cbArr[iR2] * wR2 + cbArr[iU2] * wU2 + cbArr[iD2] * wD2) / wSum
+                val avgCr = (crArr[idx] * w0 +
+                    crArr[iL] * wL + crArr[iR] * wR + crArr[iU] * wU + crArr[iD] * wD +
+                    crArr[iL2] * wL2 + crArr[iR2] * wR2 + crArr[iU2] * wU2 + crArr[iD2] * wD2) / wSum
+
+                var cb = cbArr[idx] + (avgCb - cbArr[idx]) * params.chromaDenoise
+                var cr = crArr[idx] + (avgCr - crArr[idx]) * params.chromaDenoise
+
+                val chromaMag = hypot(cb.toDouble(), cr.toDouble()).toFloat()
+                val neutralKeep = 0.45f + 0.55f * smoothstep(0.010f, 0.042f, chromaMag)
+                cb *= neutralKeep
+                cr *= neutralKeep
+
+                // 2. CAS-резкость строго по яркости Y с отсечкой шума и защитой от ореолов
+                val yAvg = (yL + yR + yU + yD) * 0.25f
+                val detail = y0 - yAvg
+                val edgeMask = smoothstep(0.014f, 0.055f, abs(detail))
+                val yMin = min(y0, min(min(yL, yR), min(yU, yD)))
+                val yMax = max(y0, max(max(yL, yR), max(yU, yD)))
+                var y = (y0 + detail * params.sharpness * edgeMask).coerceIn(yMin, yMax)
+
+                // 3. Киношная тональная кривая + вытягивание теней
+                y += params.shadowLift * y * (1f - y) * (1f - y)
+                val sCurve = y * y * (3f - 2f * y)
+                y = (y + (sCurve - y) * params.contrast).coerceIn(0f, 1f)
+
+                // 4. Умный Vibrance (нейтральные стены не красит)
+                val vibMask = smoothstep(0.025f, 0.09f, chromaMag) *
+                    (1f - smoothstep(0.22f, 0.42f, chromaMag))
+                val vibScale = 1f + params.vibrance * vibMask
+                cb *= vibScale
+                cr *= vibScale
+
+                val rOut = ((y + cr * 1.5748f).coerceIn(0f, 1f) * 255f + 0.5f).toInt()
+                val gOut = ((y - cb * 0.1873f - cr * 0.4681f).coerceIn(0f, 1f) * 255f + 0.5f).toInt()
+                val bOut = ((y + cb * 1.8556f).coerceIn(0f, 1f) * 255f + 0.5f).toInt()
+                outPixels[idx] = (pixels[idx] and (0xFF shl 24)) or (rOut shl 16) or (gOut shl 8) or bOut
+            }
+        }
+
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        out.setPixels(outPixels, 0, w, 0, 0, w, h)
+        if (working !== source) {
+            working.recycle()
         }
         return out
+    }
+
+    private fun fastWeight(x: Float): Float = 1f / (1f + x + 0.5f * x * x)
+
+    private fun smoothstep(edge0: Float, edge1: Float, x: Float): Float {
+        val t = ((x - edge0) / (edge1 - edge0)).coerceIn(0f, 1f)
+        return t * t * (3f - 2f * t)
     }
 
     private suspend fun renderVideo(
@@ -288,9 +435,9 @@ class MetaVideoProcessor(private val context: Context) {
             runCatching { mmr.release() }
         }
 
-        val minTarget = if (upscale2K) 28_000_000 else 18_000_000
-        val boostedSource = if (sourceBitrate > 0) (sourceBitrate * 1.4f).toInt() else 0
-        return maxOf(minTarget, boostedSource).coerceAtMost(45_000_000)
+        val minTarget = if (upscale2K) 35_000_000 else 24_000_000
+        val boostedSource = if (sourceBitrate > 0) (sourceBitrate * 1.6f).toInt() else 0
+        return maxOf(minTarget, boostedSource).coerceAtMost(50_000_000)
     }
 
     private fun buildVideoEffects(
@@ -299,33 +446,8 @@ class MetaVideoProcessor(private val context: Context) {
     ): List<Effect> {
         val effects = mutableListOf<Effect>()
 
-        when (options.colorPreset) {
-            ColorPreset.ORIGINAL -> Unit
-            ColorPreset.META_DAY -> {
-                // Убираем паразитный зелёный оттенок матрицы + мягкий естественный контраст
-                effects += RgbAdjustment.Builder()
-                    .setRedScale(1.03f)
-                    .setGreenScale(0.985f)
-                    .setBlueScale(1.01f)
-                    .build()
-                effects += Contrast(0.06f)
-                effects += HslAdjustment.Builder()
-                    .adjustSaturation(5f)
-                    .build()
-            }
-            ColorPreset.NIGHT_CAR -> {
-                // Деликатное осветление без вытягивания цветного шума и постеризации
-                effects += RgbAdjustment.Builder()
-                    .setRedScale(1.02f)
-                    .setGreenScale(0.98f)
-                    .setBlueScale(1.02f)
-                    .build()
-                effects += Brightness(0.035f)
-                effects += Contrast(0.04f)
-                effects += HslAdjustment.Builder()
-                    .adjustSaturation(3f)
-                    .build()
-            }
+        options.colorPreset.toGradeParams()?.let { params ->
+            effects += ProCinemaGlEffect(params)
         }
 
         if (stabTrack != null) {
@@ -337,40 +459,6 @@ class MetaVideoProcessor(private val context: Context) {
         }
 
         return effects
-    }
-
-    private fun buildPhotoColorMatrix(preset: ColorPreset): ColorMatrix? = when (preset) {
-        ColorPreset.ORIGINAL -> null
-        ColorPreset.META_DAY -> {
-            val c = 1.06f
-            val t = (-0.5f * c + 0.5f) * 255f
-            val cm = ColorMatrix(
-                floatArrayOf(
-                    c * 1.03f, 0f, 0f, 0f, t,
-                    0f, c * 0.985f, 0f, 0f, t,
-                    0f, 0f, c * 1.01f, 0f, t,
-                    0f, 0f, 0f, 1f, 0f,
-                ),
-            )
-            val sat = ColorMatrix().apply { setSaturation(1.06f) }
-            cm.postConcat(sat)
-            cm
-        }
-        ColorPreset.NIGHT_CAR -> {
-            val c = 1.04f
-            val lift = 6f
-            val cm = ColorMatrix(
-                floatArrayOf(
-                    c * 1.02f, 0f, 0f, 0f, lift,
-                    0f, c * 0.98f, 0f, 0f, lift,
-                    0f, 0f, c * 1.02f, 0f, lift,
-                    0f, 0f, 0f, 1f, 0f,
-                ),
-            )
-            val sat = ColorMatrix().apply { setSaturation(1.04f) }
-            cm.postConcat(sat)
-            cm
-        }
     }
 
     private fun buildOutputName(base: String, ext: String, options: MediaProcessingOptions): String {
@@ -428,6 +516,236 @@ class MetaVideoProcessor(private val context: Context) {
             runCatching { resolver.delete(uri, null, null) }
             throw err
         }
+    }
+}
+
+/**
+ * GPU-шейдер обработки для Media3 (OpenGL ES 2.0):
+ * 1) Билатеральный chroma denoise (убирает зелёно-розовые пятна на стенах и в тенях)
+ * 2) Адаптивная CAS-резкость только по яркости Y (без зерна и ореолов)
+ * 3) Киношная S-кривая + мягкое вытягивание теней
+ * 4) Умный Vibrance (нейтральные поверхности остаются чистыми)
+ */
+@OptIn(UnstableApi::class)
+private class ProCinemaGlEffect(private val params: GradeParams) : GlEffect {
+    override fun toGlShaderProgram(context: Context, useHdr: Boolean): GlShaderProgram =
+        ProCinemaShaderProgram(useHdr, params)
+}
+
+@OptIn(UnstableApi::class)
+private class ProCinemaShaderProgram(
+    useHdr: Boolean,
+    private val params: GradeParams,
+) : BaseGlShaderProgram(useHdr, /* texturePoolCapacity= */ 1) {
+
+    companion object {
+        private const val VERTEX_SHADER = """
+            attribute vec2 aPosition;
+            attribute vec2 aTexCoord;
+            varying vec2 vTexCoord;
+            void main() {
+                gl_Position = vec4(aPosition, 0.0, 1.0);
+                vTexCoord = aTexCoord;
+            }
+        """
+
+        private const val FRAGMENT_SHADER = """
+            precision highp float;
+            uniform sampler2D uTexSampler;
+            uniform vec2 uTexelSize;
+            uniform float uContrast;
+            uniform float uShadowLift;
+            uniform float uVibrance;
+            uniform float uSharpness;
+            uniform float uChromaDenoise;
+            varying vec2 vTexCoord;
+
+            vec3 rgb2ycc(vec3 c) {
+                float y  = dot(c, vec3(0.2126, 0.7152, 0.0722));
+                float cb = (c.b - y) * 0.5389;
+                float cr = (c.r - y) * 0.6350;
+                return vec3(y, cb, cr);
+            }
+
+            vec3 ycc2rgb(vec3 ycc) {
+                float r = ycc.x + ycc.z * 1.5748;
+                float g = ycc.x - ycc.y * 0.1873 - ycc.z * 0.4681;
+                float b = ycc.x + ycc.y * 1.8556;
+                return clamp(vec3(r, g, b), 0.0, 1.0);
+            }
+
+            void main() {
+                vec4 centerSample = texture2D(uTexSampler, vTexCoord);
+                vec3 ycc0 = rgb2ycc(centerSample.rgb);
+
+                vec3 yccL = rgb2ycc(texture2D(uTexSampler, vTexCoord + vec2(-uTexelSize.x, 0.0)).rgb);
+                vec3 yccR = rgb2ycc(texture2D(uTexSampler, vTexCoord + vec2( uTexelSize.x, 0.0)).rgb);
+                vec3 yccU = rgb2ycc(texture2D(uTexSampler, vTexCoord + vec2(0.0,  uTexelSize.y)).rgb);
+                vec3 yccD = rgb2ycc(texture2D(uTexSampler, vTexCoord + vec2(0.0, -uTexelSize.y)).rgb);
+
+                vec3 yccL2 = rgb2ycc(texture2D(uTexSampler, vTexCoord + vec2(-2.0 * uTexelSize.x, 0.0)).rgb);
+                vec3 yccR2 = rgb2ycc(texture2D(uTexSampler, vTexCoord + vec2( 2.0 * uTexelSize.x, 0.0)).rgb);
+                vec3 yccU2 = rgb2ycc(texture2D(uTexSampler, vTexCoord + vec2(0.0,  2.0 * uTexelSize.y)).rgb);
+                vec3 yccD2 = rgb2ycc(texture2D(uTexSampler, vTexCoord + vec2(0.0, -2.0 * uTexelSize.y)).rgb);
+
+                float sigma = 0.07;
+                float w0 = 1.5;
+                float wL = exp(-abs(yccL.x - ycc0.x) / sigma);
+                float wR = exp(-abs(yccR.x - ycc0.x) / sigma);
+                float wU = exp(-abs(yccU.x - ycc0.x) / sigma);
+                float wD = exp(-abs(yccD.x - ycc0.x) / sigma);
+                float wL2 = exp(-abs(yccL2.x - ycc0.x) / sigma) * 0.7;
+                float wR2 = exp(-abs(yccR2.x - ycc0.x) / sigma) * 0.7;
+                float wU2 = exp(-abs(yccU2.x - ycc0.x) / sigma) * 0.7;
+                float wD2 = exp(-abs(yccD2.x - ycc0.x) / sigma) * 0.7;
+
+                float wSum = w0 + wL + wR + wU + wD + wL2 + wR2 + wU2 + wD2;
+                vec2 avgChroma = (ycc0.yz * w0 +
+                                  yccL.yz * wL + yccR.yz * wR + yccU.yz * wU + yccD.yz * wD +
+                                  yccL2.yz * wL2 + yccR2.yz * wR2 + yccU2.yz * wU2 + yccD2.yz * wD2) / wSum;
+                vec2 chroma = mix(ycc0.yz, avgChroma, uChromaDenoise);
+
+                float chromaMag = length(chroma);
+                float neutralSuppress = smoothstep(0.010, 0.042, chromaMag);
+                chroma *= mix(0.45, 1.0, neutralSuppress);
+
+                float yAvg = (yccL.x + yccR.x + yccU.x + yccD.x) * 0.25;
+                float detail = ycc0.x - yAvg;
+                float edgeMask = smoothstep(0.014, 0.055, abs(detail));
+                float yMin = min(ycc0.x, min(min(yccL.x, yccR.x), min(yccU.x, yccD.x)));
+                float yMax = max(ycc0.x, max(max(yccL.x, yccR.x), max(yccU.x, yccD.x)));
+                float y = clamp(ycc0.x + detail * uSharpness * edgeMask, yMin, yMax);
+
+                y = y + uShadowLift * y * (1.0 - y) * (1.0 - y);
+                float sCurve = y * y * (3.0 - 2.0 * y);
+                y = clamp(mix(y, sCurve, uContrast), 0.0, 1.0);
+
+                float vibMask = smoothstep(0.025, 0.09, chromaMag) * (1.0 - smoothstep(0.22, 0.42, chromaMag));
+                chroma *= (1.0 + uVibrance * vibMask);
+
+                gl_FragColor = vec4(ycc2rgb(vec3(y, chroma)), centerSample.a);
+            }
+        """
+
+        private val QUAD_VERTICES = floatArrayOf(
+            -1f, -1f, 0f, 0f,
+             1f, -1f, 1f, 0f,
+            -1f,  1f, 0f, 1f,
+             1f,  1f, 1f, 1f,
+        )
+    }
+
+    private val vertexBuffer: FloatBuffer = ByteBuffer
+        .allocateDirect(QUAD_VERTICES.size * 4)
+        .order(ByteOrder.nativeOrder())
+        .asFloatBuffer()
+        .apply {
+            put(QUAD_VERTICES)
+            position(0)
+        }
+
+    private var programId = 0
+    private var aPosLoc = -1
+    private var aTexLoc = -1
+    private var uSamplerLoc = -1
+    private var uTexelSizeLoc = -1
+    private var uContrastLoc = -1
+    private var uShadowLiftLoc = -1
+    private var uVibranceLoc = -1
+    private var uSharpnessLoc = -1
+    private var uChromaDenoiseLoc = -1
+    private var texWidth = 1
+    private var texHeight = 1
+
+    override fun configure(inputWidth: Int, inputHeight: Int): Size {
+        texWidth = inputWidth.coerceAtLeast(1)
+        texHeight = inputHeight.coerceAtLeast(1)
+        ensureProgram()
+        return Size(inputWidth, inputHeight)
+    }
+
+    override fun drawFrame(inputTexId: Int, presentationTimeUs: Long) {
+        ensureProgram()
+        GLES20.glDisable(GLES20.GL_BLEND)
+        GLES20.glDisable(GLES20.GL_DEPTH_TEST)
+        GLES20.glUseProgram(programId)
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, inputTexId)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+
+        GLES20.glUniform1i(uSamplerLoc, 0)
+        GLES20.glUniform2f(uTexelSizeLoc, 1f / texWidth.toFloat(), 1f / texHeight.toFloat())
+        GLES20.glUniform1f(uContrastLoc, params.contrast)
+        GLES20.glUniform1f(uShadowLiftLoc, params.shadowLift)
+        GLES20.glUniform1f(uVibranceLoc, params.vibrance)
+        GLES20.glUniform1f(uSharpnessLoc, params.sharpness)
+        GLES20.glUniform1f(uChromaDenoiseLoc, params.chromaDenoise)
+
+        vertexBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(aPosLoc)
+        GLES20.glVertexAttribPointer(aPosLoc, 2, GLES20.GL_FLOAT, false, 16, vertexBuffer)
+
+        vertexBuffer.position(2)
+        GLES20.glEnableVertexAttribArray(aTexLoc)
+        GLES20.glVertexAttribPointer(aTexLoc, 2, GLES20.GL_FLOAT, false, 16, vertexBuffer)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+        GLES20.glDisableVertexAttribArray(aPosLoc)
+        GLES20.glDisableVertexAttribArray(aTexLoc)
+    }
+
+    override fun release() {
+        super.release()
+        if (programId != 0) {
+            GLES20.glDeleteProgram(programId)
+            programId = 0
+        }
+    }
+
+    private fun ensureProgram() {
+        if (programId != 0) return
+        val vs = compileShader(GLES20.GL_VERTEX_SHADER, VERTEX_SHADER)
+        val fs = compileShader(GLES20.GL_FRAGMENT_SHADER, FRAGMENT_SHADER)
+        val prog = GLES20.glCreateProgram()
+        GLES20.glAttachShader(prog, vs)
+        GLES20.glAttachShader(prog, fs)
+        GLES20.glLinkProgram(prog)
+        val linkStatus = IntArray(1)
+        GLES20.glGetProgramiv(prog, GLES20.GL_LINK_STATUS, linkStatus, 0)
+        GLES20.glDeleteShader(vs)
+        GLES20.glDeleteShader(fs)
+        if (linkStatus[0] == 0) {
+            val log = GLES20.glGetProgramInfoLog(prog)
+            GLES20.glDeleteProgram(prog)
+            throw VideoFrameProcessingException("GL link error: $log")
+        }
+        programId = prog
+        aPosLoc = GLES20.glGetAttribLocation(prog, "aPosition")
+        aTexLoc = GLES20.glGetAttribLocation(prog, "aTexCoord")
+        uSamplerLoc = GLES20.glGetUniformLocation(prog, "uTexSampler")
+        uTexelSizeLoc = GLES20.glGetUniformLocation(prog, "uTexelSize")
+        uContrastLoc = GLES20.glGetUniformLocation(prog, "uContrast")
+        uShadowLiftLoc = GLES20.glGetUniformLocation(prog, "uShadowLift")
+        uVibranceLoc = GLES20.glGetUniformLocation(prog, "uVibrance")
+        uSharpnessLoc = GLES20.glGetUniformLocation(prog, "uSharpness")
+        uChromaDenoiseLoc = GLES20.glGetUniformLocation(prog, "uChromaDenoise")
+    }
+
+    private fun compileShader(type: Int, source: String): Int {
+        val shader = GLES20.glCreateShader(type)
+        GLES20.glShaderSource(shader, source)
+        GLES20.glCompileShader(shader)
+        val compiled = IntArray(1)
+        GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0)
+        if (compiled[0] == 0) {
+            val log = GLES20.glGetShaderInfoLog(shader)
+            GLES20.glDeleteShader(shader)
+            throw VideoFrameProcessingException("GL shader compile error: $log")
+        }
+        return shader
     }
 }
 
@@ -721,7 +1039,6 @@ private object VideoMotionStabilizer {
             return acc
         }
 
-        // Грубый поиск (шаг 2)
         var bestX = 0
         var bestY = 0
         var bestCost = Long.MAX_VALUE
@@ -740,7 +1057,6 @@ private object VideoMotionStabilizer {
             dy += 2
         }
 
-        // Точный поиск (шаг 1) в окрестности минимума
         val rx0 = (bestX - 2).coerceAtLeast(-maxShift)
         val rx1 = (bestX + 2).coerceAtMost(maxShift)
         val ry0 = (bestY - 2).coerceAtLeast(-maxShift)
@@ -763,7 +1079,6 @@ private object VideoMotionStabilizer {
             return 0f to 0f
         }
 
-        // Субпиксельная параболическая интерполяция
         val subX = if (bestX > -maxShift && bestX < maxShift) {
             val left = sad(bestX - 1, bestY, step = 1).toFloat()
             val right = sad(bestX + 1, bestY, step = 1).toFloat()
@@ -803,7 +1118,6 @@ private object VideoMotionStabilizer {
             cumY[i] = cumY[i - 1] + dyList[i]
         }
 
-        // Гауссово ядро для сглаживания траектории
         val kernelSize = SMOOTH_RADIUS * 2 + 1
         val weights = FloatArray(kernelSize)
         var wSum = 0f
@@ -829,11 +1143,9 @@ private object VideoMotionStabilizer {
                 sy += cumY[idx] * w
             }
 
-            // Компенсация в долях кадра (координаты исходного буфера: +X вправо, +Y вниз)
             val corrXNorm = (sx - cumX[i]) / GRID_W.toFloat()
             val corrYNorm = (sy - cumY[i]) / GRID_H.toFloat()
 
-            // Перевод в экранные оси NDC (+X вправо, +Y вверх) с учётом поворота видео
             val (dispX, dispY) = when (rotation) {
                 90 -> -corrYNorm to -corrXNorm
                 180 -> -corrXNorm to corrYNorm
@@ -844,7 +1156,6 @@ private object VideoMotionStabilizer {
             val rawTx = dispX * 2f * ZOOM
             val rawTy = dispY * 2f * ZOOM
 
-            // Мягкое ограничение, чтобы не вылезли чёрные поля
             txArr[i] = (maxNdc * tanh((rawTx / maxNdc).toDouble())).toFloat()
             tyArr[i] = (maxNdc * tanh((rawTy / maxNdc).toDouble())).toFloat()
         }
