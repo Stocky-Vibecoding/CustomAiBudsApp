@@ -115,9 +115,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         _messages.value = emptyList()
     }
 
-    /**
-     * Подписывается на события дужки из TuneBudsManager.
-     */
     fun bindToGlasses(tuneBudsManager: TuneBudsManager) {
         if (glassesListenerJob?.isActive == true) return
         glassesListenerJob = scope.launch {
@@ -135,11 +132,11 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         if (now - lastTriggerMs < TEMPLE_DEBOUNCE_MS) return
         if (_isBusy.value) return
 
-        // Срабатываем на старт AI-чата (state == 1) или AI-конверт с дужки
         val shouldTrigger = event.state == 1 || event.command == 0x55AA
         if (!shouldTrigger) return
 
         lastTriggerMs = now
+        tuneBudsManager.setAiChatState(1)
         scope.launch {
             val useVision = _config.value.autoVisionOnTempleHold
             val prompt = if (useVision) {
