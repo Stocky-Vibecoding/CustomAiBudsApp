@@ -391,7 +391,7 @@ object TuneBudsProtocol {
 }
 
 /**
- * Точный потоковый парсер RFCOMM-данных, полностью повторяющий PacketParser.java из aibuds.apk:
+ * Потоковый парсер RFCOMM-данных, полностью повторяющий PacketParser.java из aibuds.apk:
  * - Конверт 55 AA <seq> <lenHi> <lenLo> <payload> A5 5A разбирается строго по полю длины.
  * - AB Mate пакеты проверяются по маске (b0 & 0x70) == 0 и типу (1..3).
  */
