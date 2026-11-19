@@ -228,6 +228,31 @@ class TuneBudsManager private constructor(context: Context) {
         _state.value = _state.value.copy(inEarDetectionEnabled = enabled, lastError = null)
     }
 
+    fun setKeyGesture(keyType: Int, keyFunction: Int) = launchCommand("set key gesture") {
+        request(TuneBudsProtocol.CMD_KEY, TuneBudsProtocol.buildKeyPayload(keyType, keyFunction))
+    }
+
+    fun applyTouchpadPreset(preset: Int) = launchCommand("apply touchpad preset") {
+        val pairs: List<Pair<Int, Int>> = when (preset) {
+            // 0: Классика (1 - Пауза, 2 - След., 3 - Пред.)
+            0 -> listOf(
+                TuneBudsProtocol.KEY_RIGHT_SINGLE to TuneBudsProtocol.KEY_FUNC_PLAY_PAUSE,
+                TuneBudsProtocol.KEY_RIGHT_DOUBLE to TuneBudsProtocol.KEY_FUNC_NEXT,
+                TuneBudsProtocol.KEY_RIGHT_TRIPLE to TuneBudsProtocol.KEY_FUNC_PREV,
+            )
+            // 1: Заводские (1 - Нет, 2 - Пауза, 3 - След.)
+            else -> listOf(
+                TuneBudsProtocol.KEY_RIGHT_SINGLE to TuneBudsProtocol.KEY_FUNC_NONE,
+                TuneBudsProtocol.KEY_RIGHT_DOUBLE to TuneBudsProtocol.KEY_FUNC_PLAY_PAUSE,
+                TuneBudsProtocol.KEY_RIGHT_TRIPLE to TuneBudsProtocol.KEY_FUNC_NEXT,
+            )
+        }
+        for ((type, func) in pairs) {
+            request(TuneBudsProtocol.CMD_KEY, TuneBudsProtocol.buildKeyPayload(type, func))
+            delay(120L)
+        }
+    }
+
     fun setAiChatState(state: Int) = launchCommand("set AI chat state") {
         request(TuneBudsProtocol.CMD_AI_CHAT_STATE, byteArrayOf(state.toByte()))
         _state.value = _state.value.copy(lastAiChatState = state, lastError = null)
