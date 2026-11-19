@@ -280,13 +280,10 @@ object TuneBudsProtocol {
     }
 
     fun buildVideoLimitPayload(seconds: Int): ByteArray {
-        val clamped = seconds.coerceIn(15, 720)
+        val minutes = (seconds / 60).coerceIn(1, 12)
         return buildConfigPayload(
             CONFIG_VIDEO_LIMIT_TIME,
-            byteArrayOf(
-                (clamped and 0xFF).toByte(),
-                ((clamped ushr 8) and 0xFF).toByte(),
-            ),
+            byteArrayOf(minutes.toByte()),
         )
     }
 
