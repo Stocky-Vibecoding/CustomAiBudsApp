@@ -22,11 +22,11 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.11.1'
+          gradle-version: '8.13'
 
       - name: Find and Build Debug APK
         run: |
-          GRADLE_DIR=$(dirname $(find . -maxdepth 3 -name "settings.gradle*" | head -n 1))
+          GRADLE_DIR=$(dirname $(find ./android -maxdepth 3 -name "settings.gradle*" | head -n 1))
           echo "Found Gradle project in: $GRADLE_DIR"
           cd "$GRADLE_DIR"
           if [ -f "./gradlew" ]; then
@@ -40,4 +40,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: custom-aibuds-debug-apk
-          path: "**/build/outputs/apk/debug/*.apk"
+          path: "android/**/build/outputs/apk/debug/*.apk"
