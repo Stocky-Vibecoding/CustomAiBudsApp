@@ -7,11 +7,19 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
+import android.graphics.Matrix
 import android.graphics.Paint
+import android.media.Image
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
@@ -20,18 +28,24 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.Brightness
 import androidx.media3.effect.Contrast
 import androidx.media3.effect.HslAdjustment
+import androidx.media3.effect.MatrixTransformation
 import androidx.media3.effect.Presentation
-import androidx.media3.effect.ScaleAndRotateTransformation
+import androidx.media3.effect.RgbAdjustment
 import androidx.media3.transformer.Composition
+import androidx.media3.transformer.DefaultEncoderFactory
 import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.Effects
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
+import androidx.media3.transformer.VideoEncoderSettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -41,15 +55,18 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.math.abs
+import kotlin.math.exp
+import kotlin.math.tanh
 
 enum class ColorPreset(val label: String) {
     ORIGINAL("Оригинал"),
-    META_DAY("Meta День"),
-    NIGHT_CAR("Ночь / Авто"),
+    META_DAY("Чистый день"),
+    NIGHT_CAR("Вечер / Авто"),
 }
 
 data class MediaProcessingOptions(
-    val colorPreset: ColorPreset = ColorPreset.META_DAY,
+    val colorPreset: ColorPreset = ColorPreset.ORIGINAL,
     val upscale2K: Boolean = false,
     val stabilize: Boolean = false,
     val deleteDraftAfterSave: Boolean = false,
@@ -62,85 +79,111 @@ data class MediaProcessingOptions(
 class MetaVideoProcessor(private val context: Context) {
 
     /**
-     * Обрабатывает видео по выбранным опциям и сохраняет результат в Галерею (Movies/AiBuds).
-     * Если выбран «Оригинал» и выключены апскейл/стаба — копирует мгновенно без перекодирования.
+     * Сохраняет видео в Галерею (Movies/AiBuds).
+     * В режиме «Оригинал» без 2K и стабилизации копирует исходник 1 в 1 без перекодирования.
      */
     suspend fun exportVideoToGallery(
         inputFile: File,
         options: MediaProcessingOptions,
         onProgress: (Int) -> Unit = {},
     ): Uri {
-        val fileToSave = if (!options.requiresVideoReencode) {
-            onProgress(50)
-            inputFile
+        val tempOut = if (options.requiresVideoReencode) {
+            File(context.cacheDir, "proc_${System.currentTimeMillis()}_${inputFile.name}")
         } else {
-            val tempOut = File(context.cacheDir, "proc_${System.currentTimeMillis()}_${inputFile.name}")
-            renderVideo(inputFile, tempOut, options, onProgress)
-            tempOut
+            null
         }
 
-        val galleryUri = withContext(Dispatchers.IO) {
-            saveFileToGallery(
-                file = fileToSave,
-                mimeType = "video/mp4",
-                isVideo = true,
-                displayName = buildOutputName(inputFile.nameWithoutExtension, "mp4", options),
-            )
-        }
+        try {
+            val fileToSave = if (tempOut == null) {
+                onProgress(50)
+                inputFile
+            } else {
+                val stabTrack = if (options.stabilize) {
+                    withContext(Dispatchers.Default) {
+                        VideoMotionStabilizer.analyze(inputFile) { analysisPct ->
+                            onProgress((analysisPct * 35) / 100)
+                        }
+                    }
+                } else {
+                    null
+                }
 
-        if (fileToSave != inputFile) {
-            fileToSave.delete()
-        }
-        if (options.deleteDraftAfterSave && inputFile.exists()) {
-            inputFile.delete()
-        }
+                val progressOffset = if (options.stabilize) 35 else 0
+                val progressSpan = 99 - progressOffset
+                renderVideo(inputFile, tempOut, options, stabTrack) { renderPct ->
+                    val scaled = progressOffset + (renderPct * progressSpan) / 100
+                    onProgress(scaled.coerceIn(progressOffset, 99))
+                }
+                tempOut
+            }
 
-        onProgress(100)
-        return galleryUri
+            val galleryUri = withContext(Dispatchers.IO) {
+                saveFileToGallery(
+                    file = fileToSave,
+                    mimeType = "video/mp4",
+                    isVideo = true,
+                    displayName = buildOutputName(inputFile.nameWithoutExtension, "mp4", options),
+                )
+            }
+
+            if (options.deleteDraftAfterSave && inputFile.exists()) {
+                inputFile.delete()
+            }
+
+            onProgress(100)
+            return galleryUri
+        } finally {
+            if (tempOut != null && tempOut.exists()) {
+                tempOut.delete()
+            }
+        }
     }
 
     /**
-     * Обрабатывает фото (цветокор + опциональный апскейл 2K) и сохраняет в Галерею (Pictures/AiBuds).
+     * Сохраняет фото в Галерею (Pictures/AiBuds).
+     * В режиме «Оригинал» без 2K копирует исходный JPEG без потерь.
      */
     suspend fun exportPhotoToGallery(
         inputFile: File,
         options: MediaProcessingOptions,
     ): Uri = withContext(Dispatchers.IO) {
-        val fileToSave = if (options.colorPreset == ColorPreset.ORIGINAL && !options.upscale2K) {
-            inputFile
+        val tempOut = if (options.colorPreset == ColorPreset.ORIGINAL && !options.upscale2K) {
+            null
         } else {
             val raw = BitmapFactory.decodeFile(inputFile.absolutePath)
                 ?: throw IllegalStateException("Не удалось открыть фото: ${inputFile.name}")
             val processed = applyPhotoEffects(raw, options)
             if (processed !== raw) raw.recycle()
 
-            val tempOut = File(context.cacheDir, "proc_${System.currentTimeMillis()}.jpg")
-            FileOutputStream(tempOut).use { out ->
-                processed.compress(Bitmap.CompressFormat.JPEG, 95, out)
+            File(context.cacheDir, "proc_${System.currentTimeMillis()}.jpg").also { outFile ->
+                try {
+                    FileOutputStream(outFile).use { out ->
+                        processed.compress(Bitmap.CompressFormat.JPEG, 97, out)
+                    }
+                } finally {
+                    processed.recycle()
+                }
             }
-            processed.recycle()
-            tempOut
         }
 
-        val galleryUri = saveFileToGallery(
-            file = fileToSave,
-            mimeType = "image/jpeg",
-            isVideo = false,
-            displayName = buildOutputName(inputFile.nameWithoutExtension, "jpg", options),
-        )
-
-        if (fileToSave != inputFile) {
-            fileToSave.delete()
+        try {
+            val galleryUri = saveFileToGallery(
+                file = tempOut ?: inputFile,
+                mimeType = "image/jpeg",
+                isVideo = false,
+                displayName = buildOutputName(inputFile.nameWithoutExtension, "jpg", options),
+            )
+            if (options.deleteDraftAfterSave && inputFile.exists()) {
+                inputFile.delete()
+            }
+            galleryUri
+        } finally {
+            if (tempOut != null && tempOut.exists()) {
+                tempOut.delete()
+            }
         }
-        if (options.deleteDraftAfterSave && inputFile.exists()) {
-            inputFile.delete()
-        }
-        galleryUri
     }
 
-    /**
-     * Применяет пресет цвета к Bitmap — используется и для экспорта, и для быстрого превью «До / После».
-     */
     fun applyPhotoEffects(source: Bitmap, options: MediaProcessingOptions): Bitmap {
         val targetBitmap = if (options.upscale2K && source.height < 1536) {
             val scale = 1536f / source.height.toFloat()
@@ -167,24 +210,39 @@ class MetaVideoProcessor(private val context: Context) {
         inputFile: File,
         outputFile: File,
         options: MediaProcessingOptions,
+        stabTrack: StabilizationTrack?,
         onProgress: (Int) -> Unit,
     ) = withContext(Dispatchers.Main) {
-        val videoEffects = buildVideoEffects(options)
+        val videoEffects = buildVideoEffects(options, stabTrack)
         val editedMediaItem = EditedMediaItem.Builder(MediaItem.fromUri(Uri.fromFile(inputFile)))
             .setEffects(Effects(emptyList(), videoEffects))
             .build()
 
+        val targetBitrate = withContext(Dispatchers.IO) {
+            calculateTargetBitrate(inputFile, options.upscale2K)
+        }
+
+        val encoderFactory = DefaultEncoderFactory.Builder(context)
+            .setRequestedVideoEncoderSettings(
+                VideoEncoderSettings.Builder()
+                    .setBitrate(targetBitrate)
+                    .build(),
+            )
+            .setEnableFallback(true)
+            .build()
+
         suspendCancellableCoroutine<Unit> { cont ->
             val progressHolder = ProgressHolder()
-            var progressJob: kotlinx.coroutines.Job? = null
+            var progressJob: Job? = null
 
             val transformer = Transformer.Builder(context)
                 .setVideoMimeType(MimeTypes.VIDEO_H264)
+                .setEncoderFactory(encoderFactory)
                 .addListener(
                     object : Transformer.Listener {
                         override fun onCompleted(composition: Composition, exportResult: ExportResult) {
                             progressJob?.cancel()
-                            onProgress(99)
+                            onProgress(100)
                             if (cont.isActive) cont.resume(Unit)
                         }
 
@@ -211,7 +269,7 @@ class MetaVideoProcessor(private val context: Context) {
                 while (isActive) {
                     val state = transformer.getProgress(progressHolder)
                     if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
-                        onProgress(progressHolder.progress.coerceIn(0, 98))
+                        onProgress(progressHolder.progress.coerceIn(0, 99))
                     }
                     delay(150L)
                 }
@@ -219,39 +277,62 @@ class MetaVideoProcessor(private val context: Context) {
         }
     }
 
-    private fun buildVideoEffects(options: MediaProcessingOptions): List<Effect> {
+    private fun calculateTargetBitrate(inputFile: File, upscale2K: Boolean): Int {
+        val mmr = MediaMetadataRetriever()
+        val sourceBitrate = try {
+            mmr.setDataSource(inputFile.absolutePath)
+            mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toIntOrNull() ?: 0
+        } catch (_: Throwable) {
+            0
+        } finally {
+            runCatching { mmr.release() }
+        }
+
+        val minTarget = if (upscale2K) 28_000_000 else 18_000_000
+        val boostedSource = if (sourceBitrate > 0) (sourceBitrate * 1.4f).toInt() else 0
+        return maxOf(minTarget, boostedSource).coerceAtMost(45_000_000)
+    }
+
+    private fun buildVideoEffects(
+        options: MediaProcessingOptions,
+        stabTrack: StabilizationTrack?,
+    ): List<Effect> {
         val effects = mutableListOf<Effect>()
 
         when (options.colorPreset) {
             ColorPreset.ORIGINAL -> Unit
             ColorPreset.META_DAY -> {
-                // Чистый дневной контраст и лёгкая насыщенность без провала в чёрный
-                effects += Contrast(0.14f)
+                // Убираем паразитный зелёный оттенок матрицы + мягкий естественный контраст
+                effects += RgbAdjustment.Builder()
+                    .setRedScale(1.03f)
+                    .setGreenScale(0.985f)
+                    .setBlueScale(1.01f)
+                    .build()
+                effects += Contrast(0.06f)
                 effects += HslAdjustment.Builder()
-                    .adjustSaturation(14f)
-                    .adjustLightness(2f)
+                    .adjustSaturation(5f)
                     .build()
             }
             ColorPreset.NIGHT_CAR -> {
-                // Мягкий подъём теней и яркости для сумерек и салона авто
-                effects += Brightness(0.12f)
-                effects += Contrast(0.06f)
+                // Деликатное осветление без вытягивания цветного шума и постеризации
+                effects += RgbAdjustment.Builder()
+                    .setRedScale(1.02f)
+                    .setGreenScale(0.98f)
+                    .setBlueScale(1.02f)
+                    .build()
+                effects += Brightness(0.035f)
+                effects += Contrast(0.04f)
                 effects += HslAdjustment.Builder()
-                    .adjustSaturation(8f)
-                    .adjustLightness(6f)
+                    .adjustSaturation(3f)
                     .build()
             }
         }
 
-        if (options.stabilize) {
-            // Лёгкий кроп-запас (6%) под сглаживание краёв кадра
-            effects += ScaleAndRotateTransformation.Builder()
-                .setScale(1.06f, 1.06f)
-                .build()
+        if (stabTrack != null) {
+            effects += stabTrack.toMatrixTransformation()
         }
 
         if (options.upscale2K) {
-            // Масштабирование до 2K (высота 1536 при 4:3 -> 2048x1536)
             effects += Presentation.createForHeight(1536)
         }
 
@@ -261,32 +342,32 @@ class MetaVideoProcessor(private val context: Context) {
     private fun buildPhotoColorMatrix(preset: ColorPreset): ColorMatrix? = when (preset) {
         ColorPreset.ORIGINAL -> null
         ColorPreset.META_DAY -> {
-            val contrast = 1.12f
-            val translate = (-0.5f * contrast + 0.5f) * 255f + 4f
+            val c = 1.06f
+            val t = (-0.5f * c + 0.5f) * 255f
             val cm = ColorMatrix(
                 floatArrayOf(
-                    contrast, 0f, 0f, 0f, translate,
-                    0f, contrast, 0f, 0f, translate,
-                    0f, 0f, contrast, 0f, translate,
+                    c * 1.03f, 0f, 0f, 0f, t,
+                    0f, c * 0.985f, 0f, 0f, t,
+                    0f, 0f, c * 1.01f, 0f, t,
                     0f, 0f, 0f, 1f, 0f,
                 ),
             )
-            val sat = ColorMatrix().apply { setSaturation(1.14f) }
+            val sat = ColorMatrix().apply { setSaturation(1.06f) }
             cm.postConcat(sat)
             cm
         }
         ColorPreset.NIGHT_CAR -> {
-            val contrast = 1.05f
-            val lift = 18f
+            val c = 1.04f
+            val lift = 6f
             val cm = ColorMatrix(
                 floatArrayOf(
-                    contrast, 0f, 0f, 0f, lift,
-                    0f, contrast, 0f, 0f, lift,
-                    0f, 0f, contrast, 0f, lift,
+                    c * 1.02f, 0f, 0f, 0f, lift,
+                    0f, c * 0.98f, 0f, 0f, lift,
+                    0f, 0f, c * 1.02f, 0f, lift,
                     0f, 0f, 0f, 1f, 0f,
                 ),
             )
-            val sat = ColorMatrix().apply { setSaturation(1.08f) }
+            val sat = ColorMatrix().apply { setSaturation(1.04f) }
             cm.postConcat(sat)
             cm
         }
@@ -295,8 +376,8 @@ class MetaVideoProcessor(private val context: Context) {
     private fun buildOutputName(base: String, ext: String, options: MediaProcessingOptions): String {
         val tags = buildList {
             if (options.colorPreset != ColorPreset.ORIGINAL) add(options.colorPreset.name.lowercase())
+            if (options.stabilize) add("eis")
             if (options.upscale2K) add("2k")
-            if (options.stabilize) add("stab")
         }
         val suffix = if (tags.isEmpty()) "" else "_" + tags.joinToString("_")
         return "${base}${suffix}.$ext"
@@ -332,15 +413,54 @@ class MetaVideoProcessor(private val context: Context) {
         val uri = resolver.insert(collection, values)
             ?: throw IllegalStateException("Не удалось создать запись в Галерее")
 
-        resolver.openOutputStream(uri)?.use { out ->
-            FileInputStream(file).use { input -> input.copyTo(out) }
-        } ?: throw IllegalStateException("Не удалось открыть поток записи в Галерею")
+        try {
+            resolver.openOutputStream(uri)?.use { out ->
+                FileInputStream(file).use { input -> input.copyTo(out) }
+            } ?: throw IllegalStateException("Не удалось открыть поток записи в Галерею")
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            values.clear()
-            values.put(MediaStore.MediaColumns.IS_PENDING, 0)
-            resolver.update(uri, values, null, null)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                values.clear()
+                values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                resolver.update(uri, values, null, null)
+            }
+            return uri
+        } catch (err: Throwable) {
+            runCatching { resolver.delete(uri, null, null) }
+            throw err
         }
-        return uri
     }
 }
+
+/**
+ * Готовая таблица компенсации тряски по таймкодам (в NDC-координатах Media3).
+ */
+@OptIn(UnstableApi::class)
+private class StabilizationTrack(
+    private val ptsUs: LongArray,
+    private val txNdc: FloatArray,
+    private val tyNdc: FloatArray,
+    private val zoom: Float,
+) {
+    fun toMatrixTransformation(): MatrixTransformation = object : MatrixTransformation {
+        override fun getMatrix(presentationTimeUs: Long): Matrix {
+            val (tx, ty) = sample(presentationTimeUs)
+            return Matrix().apply {
+                postScale(zoom, zoom)
+                postTranslate(tx, ty)
+            }
+        }
+    }
+
+    private fun sample(timeUs: Long): Pair<Float, Float> {
+        val n = ptsUs.size
+        if (n == 0) return 0f to 0f
+        if (n == 1 || timeUs <= ptsUs[0]) return txNdc[0] to tyNdc[0]
+        if (timeUs >= ptsUs[n - 1]) return txNdc[n - 1] to tyNdc[n - 1]
+
+        val idx = ptsUs.binarySearch(timeUs)
+        if (idx >= 0) return txNdc[idx] to tyNdc[idx]
+
+        val right = (-idx - 1).coerceIn(1, n - 1)
+        val left = right - 1
+        val dt = (ptsUs[right] - ptsUs[left]).coerceAtLeast(1L)
+        val alpha = ((timeUs - ptsUs
