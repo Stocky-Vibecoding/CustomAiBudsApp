@@ -48,6 +48,7 @@ import androidx.compose.material.icons.filled.BatteryStd
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.BluetoothConnected
 import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.DirectionsCar
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Headphones
@@ -664,6 +665,7 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
     var selectedFile by remember { mutableStateOf<File?>(null) }
     var options by remember { mutableStateOf(MediaProcessingOptions()) }
     var exportProgress by remember { mutableStateOf<Int?>(null) }
+    var showFormatDialog by remember { mutableStateOf(false) }
 
     fun reloadFiles() {
         val dirs = listOfNotNull(
@@ -755,6 +757,20 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
                         }
                         Spacer(Modifier.width(8.dp))
                         Text(if (importState.isRunning) "Идёт перенос по Wi-Fi..." else "Импорт с очков (Wi-Fi)")
+                    }
+
+                    OutlinedButton(
+                        onClick = { showFormatDialog = true },
+                        enabled = !importState.isRunning && state.protocolState == "CONNECTED",
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error,
+                        ),
+                    ) {
+                        Icon(Icons.Default.DeleteForever, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Очистить память очков")
                     }
                 }
             }
@@ -875,6 +891,30 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
                 Spacer(Modifier.height(16.dp))
             }
         }
+    }
+
+    if (showFormatDialog) {
+        AlertDialog(
+            onDismissRequest = { showFormatDialog = false },
+            title = { Text("Очистить память очков?") },
+            text = { Text("Все фото и видео на самих очках будут безвозвратно удалены. Скачанные на телефон файлы останутся.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showFormatDialog = false
+                        tuneBuds.formatStorage()
+                        Toast.makeText(context, "Команда очистки отправлена на очки", Toast.LENGTH_SHORT).show()
+                    },
+                ) {
+                    Text("Очистить", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showFormatDialog = false }) {
+                    Text("Отмена")
+                }
+            },
+        )
     }
 }
 
