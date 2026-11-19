@@ -27,6 +27,13 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 
+data class TuneBudsAiEvent(
+    val command: Int,
+    val state: Int?,
+    val rawPayload: ByteArray,
+    val timestampMs: Long = System.currentTimeMillis(),
+)
+
 data class TuneBudsState(
     val connectionLabel: String = "TuneBuds disconnected",
     val protocolState: String = TuneBudsSppState.DISCONNECTED.name,
@@ -44,6 +51,7 @@ data class TuneBudsState(
     val deviceAbility: ByteArray? = null,
     val deviceCapabilityMask: Int? = null,
     val supportDetection: Int? = null,
+    val inEarDetectionEnabled: Boolean? = null,
     val supportAudio: Int? = null,
     val videoLimitSeconds: Int? = null,
     val audioLimitSeconds: Int? = null,
@@ -53,6 +61,7 @@ data class TuneBudsState(
     val resolution: Int? = null,
     val supportOpus: Int? = null,
     val supportAiChat: Int? = null,
+    val lastAiChatState: Int? = null,
     val supportAppList: Int? = null,
     val wifiSupportMask: Int? = null,
     val storage: TuneBudsStorageInfo? = null,
@@ -65,7 +74,7 @@ data class TuneBudsState(
     val lastError: String? = null,
 )
 
-/** Owns the TuneBuds SPP session and exposes only understood AB Mate operations. */
+/** Owns the TuneBuds SPP session and exposes understood AB Mate operations. */
 class TuneBudsManager private constructor(context: Context) {
     companion object {
         private const val TAG = "TuneBudsManager"
@@ -90,10 +99,12 @@ class TuneBudsManager private constructor(context: Context) {
     private val aiPictureBuffer = ByteArrayOutputStream()
     private val _state = MutableStateFlow(TuneBudsState())
     private val _aiPhotos = MutableSharedFlow<ByteArray>(extraBufferCapacity = 1)
+    private val _aiEvents = MutableSharedFlow<TuneBudsAiEvent>(extraBufferCapacity = 16)
     private var connectJob: Job? = null
 
     val state: StateFlow<TuneBudsState> = _state.asStateFlow()
     val aiPhotos: SharedFlow<ByteArray> = _aiPhotos.asSharedFlow()
+    val aiEvents: SharedFlow<TuneBudsAiEvent> = _aiEvents.asSharedFlow()
 
     init {
         scope.launch {
@@ -196,6 +207,32 @@ class TuneBudsManager private constructor(context: Context) {
         }
     }
 
+    fun stopVideo() = launchCommand("stop video recording") {
+        stopCameraSubsystem()
+    }
+
+    fun setVideoLimit(seconds: Int) = launchCommand("set video limit") {
+        val payload = TuneBudsProtocol.buildVideoLimitPayload(seconds)
+        request(TuneBudsProtocol.CMD_GLASS_CONFIG, payload)
+        _state.value = _state.value.copy(videoLimitSeconds = seconds, lastError = null)
+        runCatching { requestDeviceInfo(TuneBudsProtocol.INFO_VIDEO_LIMIT) }
+    }
+
+    fun setWearDetection(enabled: Boolean) = launchCommand("set wear detection") {
+        requireSuccess(
+            request(
+                TuneBudsProtocol.CMD_SET_DETECTION,
+                byteArrayOf(if (enabled) 1 else 0),
+            ),
+        )
+        _state.value = _state.value.copy(inEarDetectionEnabled = enabled, lastError = null)
+    }
+
+    fun setAiChatState(state: Int) = launchCommand("set AI chat state") {
+        request(TuneBudsProtocol.CMD_AI_CHAT_STATE, byteArrayOf(state.toByte()))
+        _state.value = _state.value.copy(lastAiChatState = state, lastError = null)
+    }
+
     fun toggleAudio() = launchCommand("toggle audio recording") {
         if (_state.value.isAudioRecording) {
             stopCameraSubsystem()
@@ -254,6 +291,7 @@ class TuneBudsManager private constructor(context: Context) {
             TuneBudsProtocol.INFO_FIRMWARE_VERSION,
             TuneBudsProtocol.INFO_MODEL,
             TuneBudsProtocol.INFO_SERIAL_NUMBER,
+            TuneBudsProtocol.INFO_IN_EAR_STATE,
             TuneBudsProtocol.INFO_WIFI_SUPPORT,
         )
         requestCapabilityInfo()
@@ -270,7 +308,6 @@ class TuneBudsManager private constructor(context: Context) {
     ): String? = coroutineScope {
         if (!client.isConnected()) return@coroutineScope null
         _state.value = _state.value.copy(mediaBaseUrl = null, wifiState = null)
-        // Register before configuration so an immediate failure cannot be missed.
         val wifiFailure = launch(start = CoroutineStart.UNDISPATCHED) {
             val failed = state.first { it.wifiState in setOf(0, 4, 5) }
             throw IOException("TuneBuds Wi-Fi connection failed (state ${failed.wifiState})")
@@ -348,6 +385,7 @@ class TuneBudsManager private constructor(context: Context) {
             TuneBudsProtocol.INFO_FIRMWARE_VERSION,
             TuneBudsProtocol.INFO_MODEL,
             TuneBudsProtocol.INFO_SERIAL_NUMBER,
+            TuneBudsProtocol.INFO_IN_EAR_STATE,
             TuneBudsProtocol.INFO_VIDEO_LIMIT,
             TuneBudsProtocol.INFO_AUDIO_LIMIT,
             TuneBudsProtocol.INFO_SUPPORT_DETECTION,
@@ -424,7 +462,6 @@ class TuneBudsManager private constructor(context: Context) {
                     return
                 }
                 1 -> {
-                    // The recording has stopped, but the camera subsystem is still saving it.
                     if (attempt < CAMERA_CLOSE_MAX_ATTEMPTS - 1) delay(CAMERA_CLOSE_RETRY_MS)
                 }
                 2 -> throw IOException("TuneBuds camera is busy transferring media")
@@ -457,6 +494,25 @@ class TuneBudsManager private constructor(context: Context) {
                     .onFailure { Log.w(TAG, "Invalid device-info response", it) }
             }
             TuneBudsProtocol.INFO_BATTERY -> TuneBudsProtocol.parseBattery(frame.payload)?.let(::applyBattery)
+            TuneBudsProtocol.INFO_IN_EAR_STATE -> TuneBudsProtocol.parseSupportFlag(frame.payload)?.let { enabled ->
+                _state.value = _state.value.copy(inEarDetectionEnabled = enabled, lastError = null)
+            }
+            TuneBudsProtocol.CMD_AI_CHAT_STATE,
+            TuneBudsProtocol.CMD_AI_RECORD_STATE,
+            TuneBudsProtocol.CMD_AI_ENVELOPE -> {
+                val aiState = TuneBudsProtocol.parseStatus(frame.payload)
+                Log.i(TAG, "TuneBuds AI event cmd=0x${frame.command.toString(16)} state=$aiState len=${frame.payload.size}")
+                if (frame.command == TuneBudsProtocol.CMD_AI_CHAT_STATE && aiState != null) {
+                    _state.value = _state.value.copy(lastAiChatState = aiState)
+                }
+                _aiEvents.tryEmit(
+                    TuneBudsAiEvent(
+                        command = frame.command,
+                        state = aiState,
+                        rawPayload = frame.payload.copyOf(),
+                    ),
+                )
+            }
             TuneBudsProtocol.CMD_AI_PICTURE -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
                 handleAiPicture(frame.payload)
             }
@@ -509,6 +565,9 @@ class TuneBudsManager private constructor(context: Context) {
         }
         info[TuneBudsProtocol.INFO_SERIAL_NUMBER]?.let { payload ->
             TuneBudsProtocol.parseString(payload)?.let { current = current.copy(serialNumber = it) }
+        }
+        info[TuneBudsProtocol.INFO_IN_EAR_STATE]?.let { payload ->
+            TuneBudsProtocol.parseSupportFlag(payload)?.let { current = current.copy(inEarDetectionEnabled = it) }
         }
         info[TuneBudsProtocol.INFO_DEVICE_ABILITY]?.let { payload ->
             current = current.copy(deviceAbility = payload.copyOf())
