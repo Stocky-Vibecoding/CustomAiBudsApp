@@ -108,10 +108,6 @@ private fun ColorPreset.toGradeParams(): GradeParams? = when (this) {
 @OptIn(UnstableApi::class)
 class MetaVideoProcessor(private val context: Context) {
 
-    /**
-     * Сохраняет видео в Галерею (Movies/AiBuds).
-     * В режиме «Оригинал» без 2K и стабилизации копирует исходник 1 в 1 без перекодирования.
-     */
     suspend fun exportVideoToGallery(
         inputFile: File,
         options: MediaProcessingOptions,
@@ -169,10 +165,6 @@ class MetaVideoProcessor(private val context: Context) {
         }
     }
 
-    /**
-     * Сохраняет фото в Галерею (Pictures/AiBuds).
-     * В режиме «Оригинал» без 2K копирует исходный JPEG без потерь.
-     */
     suspend fun exportPhotoToGallery(
         inputFile: File,
         options: MediaProcessingOptions,
@@ -216,10 +208,6 @@ class MetaVideoProcessor(private val context: Context) {
         }
     }
 
-    /**
-     * Точно тот же конвейер (chroma denoise + CAS luma sharpen + filmic S-curve + smart vibrance),
-     * что и в GPU-шейдере видео. Используется и для фото, и для точного превью «До / После».
-     */
     fun applyPhotoEffects(source: Bitmap, options: MediaProcessingOptions): Bitmap {
         val working = if (options.upscale2K && source.height < 1536) {
             val scale = 1536f / source.height.toFloat()
@@ -284,7 +272,6 @@ class MetaVideoProcessor(private val context: Context) {
                 val yU = yArr[iU]
                 val yD = yArr[iD]
 
-                // 1. Билатеральное подавление цветового шума (только Cb/Cr)
                 val w0 = 1.5f
                 val wL = fastWeight(abs(yL - y0) / sigma)
                 val wR = fastWeight(abs(yR - y0) / sigma)
@@ -311,7 +298,6 @@ class MetaVideoProcessor(private val context: Context) {
                 cb *= neutralKeep
                 cr *= neutralKeep
 
-                // 2. CAS-резкость строго по яркости Y с отсечкой шума и защитой от ореолов
                 val yAvg = (yL + yR + yU + yD) * 0.25f
                 val detail = y0 - yAvg
                 val edgeMask = smoothstep(0.014f, 0.055f, abs(detail))
@@ -319,12 +305,10 @@ class MetaVideoProcessor(private val context: Context) {
                 val yMax = max(y0, max(max(yL, yR), max(yU, yD)))
                 var y = (y0 + detail * params.sharpness * edgeMask).coerceIn(yMin, yMax)
 
-                // 3. Киношная тональная кривая + вытягивание теней
                 y += params.shadowLift * y * (1f - y) * (1f - y)
                 val sCurve = y * y * (3f - 2f * y)
                 y = (y + (sCurve - y) * params.contrast).coerceIn(0f, 1f)
 
-                // 4. Умный Vibrance (нейтральные стены не красит)
                 val vibMask = smoothstep(0.025f, 0.09f, chromaMag) *
                     (1f - smoothstep(0.22f, 0.42f, chromaMag))
                 val vibScale = 1f + params.vibrance * vibMask
@@ -519,13 +503,6 @@ class MetaVideoProcessor(private val context: Context) {
     }
 }
 
-/**
- * GPU-шейдер обработки для Media3 (OpenGL ES 2.0):
- * 1) Билатеральный chroma denoise (убирает зелёно-розовые пятна на стенах и в тенях)
- * 2) Адаптивная CAS-резкость только по яркости Y (без зерна и ореолов)
- * 3) Киношная S-кривая + мягкое вытягивание теней
- * 4) Умный Vibrance (нейтральные поверхности остаются чистыми)
- */
 @OptIn(UnstableApi::class)
 private class ProCinemaGlEffect(private val params: GradeParams) : GlEffect {
     override fun toGlShaderProgram(context: Context, useHdr: Boolean): GlShaderProgram =
@@ -536,7 +513,7 @@ private class ProCinemaGlEffect(private val params: GradeParams) : GlEffect {
 private class ProCinemaShaderProgram(
     useHdr: Boolean,
     private val params: GradeParams,
-) : BaseGlShaderProgram(useHdr, /* texturePoolCapacity= */ 1) {
+) : BaseGlShaderProgram(useHdr, 1) {
 
     companion object {
         private const val VERTEX_SHADER = """
@@ -749,9 +726,6 @@ private class ProCinemaShaderProgram(
     }
 }
 
-/**
- * Готовая таблица компенсации тряски по таймкодам (в NDC-координатах Media3).
- */
 @OptIn(UnstableApi::class)
 private class StabilizationTrack(
     private val ptsUs: LongArray,
@@ -788,10 +762,6 @@ private class StabilizationTrack(
     }
 }
 
-/**
- * 2-проходной анализатор движения: декодирует Y-канал через аппаратный MediaCodec,
- * оценивает сдвиг (dx, dy) между соседними кадрами и сглаживает траекторию фильтром Гаусса.
- */
 private object VideoMotionStabilizer {
     private const val TAG = "VideoMotionStabilizer"
     private const val GRID_W = 80
