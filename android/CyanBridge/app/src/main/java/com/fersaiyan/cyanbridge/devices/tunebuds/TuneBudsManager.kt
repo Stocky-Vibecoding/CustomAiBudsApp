@@ -77,6 +77,7 @@ class TuneBudsManager private constructor(context: Context) {
     companion object {
         private const val TAG = "TuneBudsManager"
         private const val REQUEST_TIMEOUT_MS = 10_000L
+        private const val OPTIONAL_ACK_TIMEOUT_MS = 1_000L
         private const val CAMERA_CLOSE_RETRY_MS = 1_000L
         private const val CAMERA_CLOSE_MAX_ATTEMPTS = 15
         private const val FILE_MANAGER_RETRY_MS = 1_000L
@@ -290,19 +291,20 @@ class TuneBudsManager private constructor(context: Context) {
         runCatching { requestDeviceInfo(TuneBudsProtocol.INFO_KEY_SETTINGS) }
     }
 
-    /** Отправляет AIChatStateRequest (0xB0): 1 = SCO, 2 = OPUS, 0 = закрыть. */
-    fun setAiChatState(mode: Int) = launchCommand("изменить состояние ИИ") {
-        request(TuneBudsProtocol.CMD_AI_CHAT_STATE, byteArrayOf(mode.toByte()))
-        _state.value = _state.value.copy(lastAiChatState = mode, lastError = null)
-    }
-
-    suspend fun setAiChatStateBlocking(mode: Int): Boolean {
-        if (!client.isConnected()) return false
-        return runCatching {
-            request(TuneBudsProtocol.CMD_AI_CHAT_STATE, byteArrayOf(mode.toByte()))
-            _state.value = _state.value.copy(lastAiChatState = mode, lastError = null)
-            true
-        }.getOrDefault(false)
+    /**
+     * Отправляет AIChatStateRequest (0xB0): 1 = SCO, 2 = OPUS, 0 = закрыть.
+     * Не блокирует очередь на 10с и не бросает ошибку, если прошивка не шлёт RESPONSE на 0xB0.
+     */
+    fun setAiChatState(mode: Int) {
+        scope.launch {
+            if (!client.isConnected()) return@launch
+            runCatching {
+                requestOptionalAck(TuneBudsProtocol.CMD_AI_CHAT_STATE, byteArrayOf(mode.toByte()))
+                _state.value = _state.value.copy(lastAiChatState = mode)
+            }.onFailure { err ->
+                Log.w(TAG, "setAiChatState($mode) error: ${err.message}")
+            }
+        }
     }
 
     fun toggleAudio() = launchCommand("переключить аудиозапись") {
@@ -526,6 +528,29 @@ class TuneBudsManager private constructor(context: Context) {
         coroutineScope {
             val response = async(start = CoroutineStart.UNDISPATCHED) {
                 withTimeout(REQUEST_TIMEOUT_MS) {
+                    client.frames
+                        .filter { it.type == TuneBudsFrameType.RESPONSE && it.command == command }
+                        .first()
+                }
+            }
+            try {
+                client.send(command, payload).getOrThrow()
+                response.await()
+            } catch (error: Throwable) {
+                response.cancel()
+                throw error
+            }
+        }
+    }
+
+    private suspend fun requestOptionalAck(
+        command: Int,
+        payload: ByteArray = byteArrayOf(),
+        timeoutMs: Long = OPTIONAL_ACK_TIMEOUT_MS,
+    ): TuneBudsFrame? = requestMutex.withLock {
+        coroutineScope {
+            val response = async(start = CoroutineStart.UNDISPATCHED) {
+                withTimeoutOrNull(timeoutMs) {
                     client.frames
                         .filter { it.type == TuneBudsFrameType.RESPONSE && it.command == command }
                         .first()
