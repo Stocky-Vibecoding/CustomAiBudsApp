@@ -1,6 +1,13 @@
 package com.fersaiyan.cyanbridge.ai
 
 import android.content.Context
+import android.content.Intent
+import android.media.AudioManager
+import android.media.ToneGenerator
+import android.os.Bundle
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.util.Base64
 import android.util.Log
@@ -29,7 +36,7 @@ data class GeminiConfig(
     val baseUrl: String = "https://generativelanguage.googleapis.com",
     val model: String = "gemini-2.5-flash",
     val speakResponses: Boolean = true,
-    val autoVisionOnTempleHold: Boolean = true,
+    val autoVisionOnTempleHold: Boolean = false,
 )
 
 data class GeminiChatMessage(
@@ -49,6 +56,17 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         private const val KEY_SPEAK = "speak_responses"
         private const val KEY_AUTO_VISION = "auto_vision"
         private const val TEMPLE_DEBOUNCE_MS = 2_500L
+
+        private val VISION_TRIGGERS = listOf(
+            "посмотри",
+            "глянь",
+            "взгляни",
+            "что видишь",
+            "что ты видишь",
+            "что передо мной",
+            "сфоткай",
+            "сфотографируй",
+        )
 
         @Volatile
         private var instance: GeminiGlassAssistant? = null
@@ -81,6 +99,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
 
     private var tts: TextToSpeech? = null
     private var ttsReady = false
+    private var speechRecognizer: SpeechRecognizer? = null
     private var glassesListenerJob: Job? = null
     private var lastTriggerMs = 0L
 
@@ -137,14 +156,94 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
 
         lastTriggerMs = now
         tuneBudsManager.setAiChatState(1)
-        scope.launch {
-            val useVision = _config.value.autoVisionOnTempleHold
-            val prompt = if (useVision) {
-                "Кратко и по делу опиши, что ты видишь на фото с моих умных очков (1–2 предложения на русском)."
-            } else {
-                "Привет! Я вызвал тебя с дужки умных очков. Коротко подтверди, что ты на связи."
+        startVoiceListening(tuneBudsManager)
+    }
+
+    private fun startVoiceListening(tuneBudsManager: TuneBudsManager) {
+        scope.launch(Dispatchers.Main) {
+            if (!SpeechRecognizer.isRecognitionAvailable(context)) {
+                _lastTempleLog.value = "Распознавание речи недоступно на устройстве"
+                tuneBudsManager.setAiChatState(0)
+                return@launch
             }
-            ask(prompt = prompt, withGlassPhoto = useVision, tuneBudsManager = tuneBudsManager)
+
+            _isBusy.value = true
+            _lastTempleLog.value = "Слушаю голос..."
+            playListenBeep()
+
+            runCatching { speechRecognizer?.destroy() }
+            val recognizer = SpeechRecognizer.createSpeechRecognizer(context.applicationContext)
+            speechRecognizer = recognizer
+
+            recognizer.setRecognitionListener(
+                object : RecognitionListener {
+                    override fun onReadyForSpeech(params: Bundle?) = Unit
+                    override fun onBeginningOfSpeech() = Unit
+                    override fun onRmsChanged(rmsdB: Float) = Unit
+                    override fun onBufferReceived(buffer: ByteArray?) = Unit
+                    override fun onEndOfSpeech() {
+                        _lastTempleLog.value = "Обрабатываю запрос..."
+                    }
+
+                    override fun onError(error: Int) {
+                        Log.w(TAG, "SpeechRecognizer error=$error")
+                        _lastTempleLog.value = "Голос не распознан (код $error)"
+                        _isBusy.value = false
+                        tuneBudsManager.setAiChatState(0)
+                    }
+
+                    override fun onResults(results: Bundle?) {
+                        val spoken = results
+                            ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                            ?.firstOrNull()
+                            ?.trim()
+                            .orEmpty()
+
+                        if (spoken.isBlank()) {
+                            _lastTempleLog.value = "Пустой голосовой запрос"
+                            _isBusy.value = false
+                            tuneBudsManager.setAiChatState(0)
+                            return
+                        }
+
+                        val lower = spoken.lowercase(Locale("ru", "RU"))
+                        val wantsPhoto = _config.value.autoVisionOnTempleHold ||
+                            VISION_TRIGGERS.any { lower.contains(it) }
+
+                        _lastTempleLog.value = if (wantsPhoto) {
+                            "Запрос с фото: «$spoken»"
+                        } else {
+                            "Запрос: «$spoken»"
+                        }
+
+                        scope.launch {
+                            ask(
+                                prompt = spoken,
+                                withGlassPhoto = wantsPhoto,
+                                tuneBudsManager = tuneBudsManager,
+                            )
+                            tuneBudsManager.setAiChatState(0)
+                        }
+                    }
+
+                    override fun onPartialResults(partialResults: Bundle?) = Unit
+                    override fun onEvent(eventType: Int, params: Bundle?) = Unit
+                },
+            )
+
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            }
+            recognizer.startListening(intent)
+        }
+    }
+
+    private fun playListenBeep() {
+        runCatching {
+            val tone = ToneGenerator(AudioManager.STREAM_MUSIC, 70)
+            tone.startTone(ToneGenerator.TONE_PROP_BEEP, 120)
         }
     }
 
@@ -157,6 +256,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         if (cfg.apiKey.isBlank()) {
             val msg = "Укажи API-ключ Gemini в настройках ИИ."
             appendMessage(isUser = false, text = msg)
+            _isBusy.value = false
             return msg
         }
 
@@ -170,7 +270,13 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 null
             }
 
-            val reply = sendGeminiRequest(cfg, prompt, photoBytes)
+            val fullPrompt = if (photoBytes != null) {
+                "$prompt (Ответь кратко, 1–3 предложения на русском, удобно для озвучки.)"
+            } else {
+                "$prompt (Ответь кратко и по делу на русском, 1–3 предложения.)"
+            }
+
+            val reply = sendGeminiRequest(cfg, fullPrompt, photoBytes)
             appendMessage(isUser = false, text = reply)
             if (cfg.speakResponses) {
                 speak(reply)
@@ -251,6 +357,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             .ifBlank { "https://generativelanguage.googleapis.com" },
         model = prefs.getString(KEY_MODEL, "gemini-2.5-flash").orEmpty().ifBlank { "gemini-2.5-flash" },
         speakResponses = prefs.getBoolean(KEY_SPEAK, true),
-        autoVisionOnTempleHold = prefs.getBoolean(KEY_AUTO_VISION, true),
+        autoVisionOnTempleHold = prefs.getBoolean(KEY_AUTO_VISION, false),
     )
 }
