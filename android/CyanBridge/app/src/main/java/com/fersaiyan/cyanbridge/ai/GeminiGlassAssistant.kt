@@ -4,8 +4,8 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioDeviceInfo
 import android.media.AudioManager
-import android.media.ToneGenerator
 import android.os.Build
 import android.os.Bundle
 import android.speech.RecognitionListener
@@ -14,6 +14,7 @@ import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.util.Base64
 import android.util.Log
+import android.widget.Toast
 import androidx.core.content.ContextCompat
 import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsAiEvent
 import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsManager
@@ -61,13 +62,18 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         private const val KEY_SPEAK = "speak_responses"
         private const val KEY_AUTO_VISION = "auto_vision"
         private const val TEMPLE_DEBOUNCE_MS = 2_500L
-        private const val VOICE_WATCHDOG_MS = 15_000L
+        private const val VOICE_WATCHDOG_MS = 16_000L
 
         private const val GLASSES_SYSTEM_PROMPT =
             "Ты — голосовой ИИ-ассистент в умных очках. Твои ответы сразу озвучиваются голосом (TTS) прямо в уши пользователю. " +
                 "Отвечай максимально кратко, чётко и по делу (1–3 предложения). " +
                 "Никогда не используй Markdown, звёздочки, решётки, тире для списков, эмодзи и любые лишние символы — " +
                 "только чистый живой разговорный текст на русском языке."
+
+        private val FALLBACK_MODELS = listOf(
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash",
+        )
 
         private val VISION_TRIGGERS = listOf(
             "посмотри",
@@ -90,6 +96,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
     }
 
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
@@ -115,6 +122,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
     private var glassesListenerJob: Job? = null
     private var voiceWatchdogJob: Job? = null
     private var lastTriggerMs = 0L
+    private var scoActive = false
 
     init {
         tts = TextToSpeech(context.applicationContext) { status ->
@@ -156,19 +164,35 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         }
     }
 
+    /** Вызывается при системном Bluetooth HFP Voice Command (удержание дужки) или кнопке микрофона. */
+    fun triggerFromVoiceButton(tuneBudsManager: TuneBudsManager) {
+        val now = System.currentTimeMillis()
+        if (now - lastTriggerMs < TEMPLE_DEBOUNCE_MS) return
+        if (_isBusy.value) return
+        lastTriggerMs = now
+        _lastTempleLog.value = "Запуск голосового ввода (Bluetooth HFP)..."
+        startVoiceListening(tuneBudsManager)
+    }
+
     private fun handleTempleEvent(event: TuneBudsAiEvent, tuneBudsManager: TuneBudsManager) {
+        // Игнорируем сервисный пакет инициализации 55 AA 02 00 ...
+        if (event.command == 0x55AA &&
+            event.rawPayload.size >= 4 &&
+            event.rawPayload[2] == 0x02.toByte() &&
+            event.rawPayload[3] == 0x00.toByte()
+        ) {
+            return
+        }
+
         val now = System.currentTimeMillis()
         if (now - lastTriggerMs < TEMPLE_DEBOUNCE_MS) return
         if (_isBusy.value) return
 
-        val shouldTrigger = event.command == 0x55AA || event.state == 1
+        val shouldTrigger = event.state == 1 || event.command == 0x55AA
         if (!shouldTrigger) return
 
         lastTriggerMs = now
-        val hex = event.rawPayload.take(8).joinToString(" ") { "%02X".format(it) }
-        _lastTempleLog.value = "Пойман сигнал дужки [$hex]"
-
-        tuneBudsManager.setAiChatState(1)
+        _lastTempleLog.value = "Пойман SPP-сигнал дужки — включаю микрофон..."
         startVoiceListening(tuneBudsManager)
     }
 
@@ -183,7 +207,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 val msg = "Нет доступа к микрофону — выдай разрешение в настройках приложения."
                 _lastTempleLog.value = msg
                 appendMessage(isUser = false, text = msg)
-                tuneBudsManager.setAiChatState(0)
                 return@launch
             }
 
@@ -192,13 +215,18 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 val msg = "Сервис распознавания речи не найден — включи Голосовой ввод Google."
                 _lastTempleLog.value = msg
                 appendMessage(isUser = false, text = msg)
-                tuneBudsManager.setAiChatState(0)
                 return@launch
             }
 
             _isBusy.value = true
-            _lastTempleLog.value = "Слушаю голос..."
-            playListenBeep()
+            tts?.stop()
+
+            val usingSco = enableBluetoothMicIfAvailable()
+            delay(if (usingSco) 450L else 350L)
+
+            _lastTempleLog.value = if (usingSco) "Слушаю (микрофон очков)..." else "Слушаю (микрофон телефона)..."
+            Toast.makeText(context, "Слушаю... Говори", Toast.LENGTH_SHORT).show()
+
             destroyRecognizer()
             speechRecognizer = recognizer
 
@@ -208,8 +236,8 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 if (_isBusy.value && speechRecognizer != null) {
                     _lastTempleLog.value = "Таймаут ожидания речи"
                     destroyRecognizer()
+                    disableBluetoothMic()
                     _isBusy.value = false
-                    tuneBudsManager.setAiChatState(0)
                 }
             }
 
@@ -223,22 +251,23 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                     override fun onRmsChanged(rmsdB: Float) = Unit
                     override fun onBufferReceived(buffer: ByteArray?) = Unit
                     override fun onEndOfSpeech() {
-                        _lastTempleLog.value = "Распознаю речь..."
+                        _lastTempleLog.value = "Обрабатываю голос..."
                     }
 
                     override fun onError(error: Int) {
                         voiceWatchdogJob?.cancel()
                         destroyRecognizer()
+                        disableBluetoothMic()
                         val errMsg = speechErrorToRussian(error)
                         Log.w(TAG, "SpeechRecognizer error=$error ($errMsg)")
                         _lastTempleLog.value = errMsg
                         _isBusy.value = false
-                        tuneBudsManager.setAiChatState(0)
                     }
 
                     override fun onResults(results: Bundle?) {
                         voiceWatchdogJob?.cancel()
                         destroyRecognizer()
+                        disableBluetoothMic()
 
                         val spoken = results
                             ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
@@ -249,7 +278,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                         if (spoken.isBlank()) {
                             _lastTempleLog.value = "Речь не распознана"
                             _isBusy.value = false
-                            tuneBudsManager.setAiChatState(0)
                             return
                         }
 
@@ -269,11 +297,19 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                                 withGlassPhoto = wantsPhoto,
                                 tuneBudsManager = tuneBudsManager,
                             )
-                            tuneBudsManager.setAiChatState(0)
                         }
                     }
 
-                    override fun onPartialResults(partialResults: Bundle?) = Unit
+                    override fun onPartialResults(partialResults: Bundle?) {
+                        val partial = partialResults
+                            ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                            ?.firstOrNull()
+                            ?.trim()
+                        if (!partial.isNullOrBlank()) {
+                            _lastTempleLog.value = "Слышу: «$partial»"
+                        }
+                    }
+
                     override fun onEvent(eventType: Int, params: Bundle?) = Unit
                 },
             )
@@ -281,7 +317,9 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
-                putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
+                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2_500L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2_000L)
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
             }
             runCatching {
@@ -289,11 +327,56 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             }.onFailure { err ->
                 voiceWatchdogJob?.cancel()
                 destroyRecognizer()
+                disableBluetoothMic()
                 _lastTempleLog.value = "Ошибка запуска микрофона: ${err.message}"
                 _isBusy.value = false
-                tuneBudsManager.setAiChatState(0)
             }
         }
+    }
+
+    private fun enableBluetoothMicIfAvailable(): Boolean {
+        return runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val btDevice = audioManager.availableCommunicationDevices.firstOrNull {
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                        it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+                }
+                if (btDevice != null) {
+                    val ok = audioManager.setCommunicationDevice(btDevice)
+                    scoActive = ok
+                    ok
+                } else {
+                    false
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                if (audioManager.isBluetoothScoAvailableOffCall) {
+                    audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                    audioManager.startBluetoothSco()
+                    audioManager.isBluetoothScoOn = true
+                    scoActive = true
+                    true
+                } else {
+                    false
+                }
+            }
+        }.getOrDefault(false)
+    }
+
+    private fun disableBluetoothMic() {
+        if (!scoActive) return
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                audioManager.clearCommunicationDevice()
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.isBluetoothScoOn = false
+                @Suppress("DEPRECATION")
+                audioManager.stopBluetoothSco()
+                audioManager.mode = AudioManager.MODE_NORMAL
+            }
+        }
+        scoActive = false
     }
 
     private fun createBestRecognizer(): SpeechRecognizer? {
@@ -327,17 +410,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         else -> "Ошибка распознавания речи (код $code)"
     }
 
-    private fun playListenBeep() {
-        scope.launch {
-            runCatching {
-                val tone = ToneGenerator(AudioManager.STREAM_MUSIC, 65)
-                tone.startTone(ToneGenerator.TONE_PROP_BEEP, 120)
-                delay(250L)
-                tone.release()
-            }
-        }
-    }
-
     suspend fun ask(
         prompt: String,
         withGlassPhoto: Boolean = false,
@@ -361,7 +433,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 null
             }
 
-            val rawReply = sendGeminiRequest(cfg, prompt, photoBytes)
+            val rawReply = sendGeminiWithFallback(cfg, prompt, photoBytes)
             val cleanReply = cleanForSpeech(rawReply)
             appendMessage(isUser = false, text = cleanReply)
             if (cfg.speakResponses) {
@@ -376,6 +448,32 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         } finally {
             _isBusy.value = false
         }
+    }
+
+    private suspend fun sendGeminiWithFallback(
+        cfg: GeminiConfig,
+        prompt: String,
+        jpegBytes: ByteArray?,
+    ): String {
+        val modelsToTry = (listOf(cfg.model) + FALLBACK_MODELS).distinct()
+        var lastError: Throwable? = null
+
+        for ((index, modelName) in modelsToTry.withIndex()) {
+            val attempts = if (index == 0) 2 else 1
+            repeat(attempts) { attempt ->
+                try {
+                    return sendGeminiRequest(cfg.copy(model = modelName), prompt, jpegBytes)
+                } catch (err: Throwable) {
+                    lastError = err
+                    val msg = err.message.orEmpty()
+                    val isTransient = msg.contains("HTTP 503") || msg.contains("HTTP 429") || msg.contains("HTTP 500")
+                    if (!isTransient) throw err
+                    Log.w(TAG, "Model $modelName transient error (attempt ${attempt + 1}): $msg")
+                    delay(1_100L)
+                }
+            }
+        }
+        throw lastError ?: IllegalStateException("Все модели Gemini временно перегружены")
     }
 
     private suspend fun sendGeminiRequest(
