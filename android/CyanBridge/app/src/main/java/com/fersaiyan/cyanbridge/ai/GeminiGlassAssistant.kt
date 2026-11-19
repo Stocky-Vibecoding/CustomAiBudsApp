@@ -57,6 +57,12 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         private const val KEY_AUTO_VISION = "auto_vision"
         private const val TEMPLE_DEBOUNCE_MS = 2_500L
 
+        private const val GLASSES_SYSTEM_PROMPT =
+            "Ты — голосовой ИИ-ассистент в умных очках. Твои ответы сразу озвучиваются голосом (TTS) прямо в уши пользователю. " +
+                "Отвечай максимально кратко, чётко и по делу (1–3 предложения). " +
+                "Никогда не используй Markdown, звёздочки, решётки, тире для списков, эмодзи и любые лишние символы — " +
+                "только чистый живой разговорный текст на русском языке."
+
         private val VISION_TRIGGERS = listOf(
             "посмотри",
             "глянь",
@@ -270,18 +276,13 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 null
             }
 
-            val fullPrompt = if (photoBytes != null) {
-                "$prompt (Ответь кратко, 1–3 предложения на русском, удобно для озвучки.)"
-            } else {
-                "$prompt (Ответь кратко и по делу на русском, 1–3 предложения.)"
-            }
-
-            val reply = sendGeminiRequest(cfg, fullPrompt, photoBytes)
-            appendMessage(isUser = false, text = reply)
+            val rawReply = sendGeminiRequest(cfg, prompt, photoBytes)
+            val cleanReply = cleanForSpeech(rawReply)
+            appendMessage(isUser = false, text = cleanReply)
             if (cfg.speakResponses) {
-                speak(reply)
+                speak(cleanReply)
             }
-            reply
+            cleanReply
         } catch (error: Throwable) {
             val errText = "Ошибка Gemini: ${error.message ?: "нет ответа"}"
             Log.e(TAG, errText, error)
@@ -299,6 +300,11 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
     ): String = withContext(Dispatchers.IO) {
         val url = "${cfg.baseUrl}/v1beta/models/${cfg.model}:generateContent?key=${cfg.apiKey}"
 
+        val systemInstruction = JSONObject().put(
+            "parts",
+            JSONArray().put(JSONObject().put("text", GLASSES_SYSTEM_PROMPT)),
+        )
+
         val parts = JSONArray().apply {
             put(JSONObject().put("text", prompt))
             if (jpegBytes != null && jpegBytes.isNotEmpty()) {
@@ -315,6 +321,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         }
 
         val bodyJson = JSONObject()
+            .put("system_instruction", systemInstruction)
             .put("contents", JSONArray().put(JSONObject().put("parts", parts)))
             .toString()
 
@@ -339,9 +346,14 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         }
     }
 
+    private fun cleanForSpeech(text: String): String = text
+        .replace(Regex("[*_`#~>|]"), " ")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+
     fun speak(text: String) {
         if (!ttsReady) return
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "gemini_${System.currentTimeMillis()}")
+        tts?.speak(cleanForSpeech(text), TextToSpeech.QUEUE_FLUSH, null, "gemini_${System.currentTimeMillis()}")
     }
 
     private fun appendMessage(isUser: Boolean, text: String, hasPhoto: Boolean = false) {
