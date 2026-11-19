@@ -1327,6 +1327,20 @@ private fun ExactGradeFramePreview(
                 contentScale = ContentScale.Fit,
                 modifier = Modifier.fillMaxSize(),
             )
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(8.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color.Black.copy(alpha = 0.65f))
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+            ) {
+                Text(
+                    text = if (preset == ColorPreset.ORIGINAL) "ОРИГИНАЛ" else "ОБРАБОТКА: ${preset.label}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (preset == ColorPreset.ORIGINAL) Color.White else Color(0xFF34D399),
+                )
+            }
         } else {
             CircularProgressIndicator(modifier = Modifier.size(28.dp))
         }
@@ -1437,7 +1451,6 @@ private fun SettingsSheetContent(
     var baseUrl by remember(cfg) { mutableStateOf(cfg.baseUrl) }
     var model by remember(cfg) { mutableStateOf(cfg.model) }
     var speak by remember(cfg) { mutableStateOf(cfg.speakResponses) }
-    var autoVision by remember(cfg) { mutableStateOf(cfg.autoVisionOnTempleHold) }
     var promptInput by remember { mutableStateOf("") }
 
     Column(
@@ -1534,14 +1547,6 @@ private fun SettingsSheetContent(
             Text("Озвучивать ответы (TTS)")
             Switch(checked = speak, onCheckedChange = { speak = it })
         }
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text("Всегда делать фото при удержании")
-            Switch(checked = autoVision, onCheckedChange = { autoVision = it })
-        }
 
         Button(
             onClick = {
@@ -1551,7 +1556,6 @@ private fun SettingsSheetContent(
                         baseUrl = baseUrl,
                         model = model,
                         speakResponses = speak,
-                        autoVisionOnTempleHold = autoVision,
                     ),
                 )
                 Toast.makeText(context, "Настройки ИИ сохранены!", Toast.LENGTH_SHORT).show()
