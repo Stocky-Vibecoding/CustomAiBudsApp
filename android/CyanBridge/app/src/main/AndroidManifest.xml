@@ -72,6 +72,28 @@
         <meta-data android:name="com.mentra.bluetoothsdk.analytics.disabled" android:value="true" />
         <activity android:name=".ui.MentraPairingActivity" android:exported="false" />
 
+        <activity
+            android:name=".ui.AiBudsMainActivity"
+            android:exported="true"
+            android:label="AiBuds Studio"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".ui.CarModeTileService"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:label="Режим Авто"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
         <activity android:name=".ui.WelcomeActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
