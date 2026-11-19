@@ -116,11 +116,15 @@ import com.fersaiyan.cyanbridge.media.MediaProcessingOptions
 import com.fersaiyan.cyanbridge.media.MetaVideoProcessor
 import com.fersaiyan.cyanbridge.media.TuneBudsWifiImporter
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
 class AiBudsMainActivity : ComponentActivity() {
+    private lateinit var tuneBuds: TuneBudsManager
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -133,13 +137,14 @@ class AiBudsMainActivity : ComponentActivity() {
                 add(Manifest.permission.NEARBY_WIFI_DEVICES)
             }
             add(Manifest.permission.ACCESS_FINE_LOCATION)
+            add(Manifest.permission.RECORD_AUDIO)
         }.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
 
         if (perms.isNotEmpty()) {
             ActivityCompat.requestPermissions(this, perms.toTypedArray(), 101)
         }
 
-        val tuneBuds = TuneBudsManager.getInstance(applicationContext)
+        tuneBuds = TuneBudsManager.getInstance(applicationContext)
         val carMode = CarModeAudioManager.getInstance(applicationContext)
         val gemini = GeminiGlassAssistant.getInstance(applicationContext)
         gemini.bindToGlasses(tuneBuds)
@@ -162,6 +167,13 @@ class AiBudsMainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onResume() {
+        super.onResume()
+        if (::tuneBuds.isInitialized && tuneBuds.isConnected()) {
+            tuneBuds.refreshStatus()
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -177,6 +189,19 @@ private fun AiBudsRootScreen(
     val glassState by tuneBuds.state.collectAsState()
     val carModeEnabled by carMode.isCarModeEnabled.collectAsState()
     val carModeStatus by carMode.statusMessage.collectAsState()
+
+    // Автообновление статусов очков каждые 15 секунд, пока подключены и не идёт запись
+    LaunchedEffect(glassState.protocolState) {
+        if (glassState.protocolState == "CONNECTED") {
+            while (isActive) {
+                delay(15_000L)
+                val cur = tuneBuds.state.value
+                if (cur.protocolState == "CONNECTED" && !cur.isVideoRecording && !cur.isAudioRecording) {
+                    tuneBuds.refreshStatus()
+                }
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -683,6 +708,9 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
     }
 
     LaunchedEffect(Unit) { reloadFiles() }
+    LaunchedEffect(importState.isRunning) {
+        if (!importState.isRunning) reloadFiles()
+    }
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val columns = if (maxWidth >= 600.dp) 4 else 2
