@@ -1,8 +1,15 @@
 package com.fersaiyan.cyanbridge.ui
 
+import android.Manifest
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothManager
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.ThumbnailUtils
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
@@ -38,8 +45,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.BatteryStd
+import androidx.compose.material.icons.filled.Bluetooth
+import androidx.compose.material.icons.filled.BluetoothConnected
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.DirectionsCar
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Refresh
@@ -48,6 +58,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -69,6 +80,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
@@ -91,6 +103,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import com.fersaiyan.cyanbridge.ai.CarModeAudioManager
 import com.fersaiyan.cyanbridge.ai.GeminiConfig
 import com.fersaiyan.cyanbridge.ai.GeminiGlassAssistant
@@ -107,6 +121,16 @@ import java.io.File
 class AiBudsMainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val missing = listOf(
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.BLUETOOTH_SCAN,
+            ).filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
+            if (missing.isNotEmpty()) {
+                ActivityCompat.requestPermissions(this, missing.toTypedArray(), 101)
+            }
+        }
 
         val tuneBuds = TuneBudsManager.getInstance(applicationContext)
         val carMode = CarModeAudioManager.getInstance(applicationContext)
@@ -214,6 +238,7 @@ private fun AiBudsRootScreen(
     }
 }
 
+@SuppressLint("MissingPermission")
 @Composable
 private fun DeviceTab(
     state: TuneBudsState,
@@ -224,8 +249,15 @@ private fun DeviceTab(
     gemini: GeminiGlassAssistant,
     onOpenAiSheet: () -> Unit,
 ) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val geminiBusy by gemini.isBusy.collectAsState()
+    var showConnectDialog by remember { mutableStateOf(false) }
+
+    val prefs = remember { context.getSharedPreferences("aibuds_ui_prefs", Context.MODE_PRIVATE) }
+    val savedMac = remember { prefs.getString("last_mac", null) }
+    val savedName = remember { prefs.getString("last_name", null) }
+    val isConnected = state.protocolState == "CONNECTED"
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val isWide = maxWidth >= 600.dp
@@ -251,14 +283,14 @@ private fun DeviceTab(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = state.deviceName ?: state.model ?: "Smart Glasses",
+                                text = state.deviceName ?: state.model ?: savedName ?: "Smart Glasses",
                                 style = MaterialTheme.typography.titleLarge,
                                 fontWeight = FontWeight.Bold,
                             )
                             Text(
                                 text = state.connectionLabel,
                                 style = MaterialTheme.typography.bodyMedium,
-                                color = if (state.protocolState == "CONNECTED") {
+                                color = if (isConnected) {
                                     MaterialTheme.colorScheme.secondary
                                 } else {
                                     MaterialTheme.colorScheme.onSurfaceVariant
@@ -277,6 +309,42 @@ private fun DeviceTab(
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.SemiBold,
                             )
+                        }
+                    }
+
+                    // Кнопка подключения / отключения очков
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        if (isConnected) {
+                            OutlinedButton(
+                                onClick = { tuneBuds.disconnect() },
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(12.dp),
+                            ) {
+                                Icon(Icons.Default.BluetoothConnected, contentDescription = null)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Отключить очки")
+                            }
+                        } else {
+                            Button(
+                                onClick = { showConnectDialog = true },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(12.dp),
+                            ) {
+                                Icon(Icons.Default.Bluetooth, contentDescription = null)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Подключить очки")
+                            }
+                            if (!savedMac.isNullOrBlank()) {
+                                OutlinedButton(
+                                    onClick = { tuneBuds.connect(savedMac, savedName) },
+                                    shape = RoundedCornerShape(12.dp),
+                                ) {
+                                    Text("Быстро")
+                                }
+                            }
                         }
                     }
 
@@ -324,65 +392,61 @@ private fun DeviceTab(
             }
 
             // Быстрые действия: Фото / Видео / Gemini Vision
-            val actionsContent: @Composable () -> Unit = {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    Button(
-                        onClick = { tuneBuds.takePhoto() },
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(14.dp),
-                    ) {
-                        Icon(Icons.Default.CameraAlt, contentDescription = null)
-                        Spacer(Modifier.width(6.dp))
-                        Text("Фото")
-                    }
-                    Button(
-                        onClick = { tuneBuds.toggleVideo() },
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(14.dp),
-                        colors = if (state.isVideoRecording) {
-                            ButtonDefaults.buttonColors(containerColor = Color(0xFFE53935))
-                        } else {
-                            ButtonDefaults.buttonColors()
-                        },
-                    ) {
-                        Icon(
-                            if (state.isVideoRecording) Icons.Default.Stop else Icons.Default.Videocam,
-                            contentDescription = null,
-                        )
-                        Spacer(Modifier.width(6.dp))
-                        Text(if (state.isVideoRecording) "Стоп" else "Видео")
-                    }
-                }
-
-                OutlinedButton(
-                    onClick = {
-                        scope.launch {
-                            gemini.ask(
-                                prompt = "Опиши кратко, что сейчас перед моими глазами.",
-                                withGlassPhoto = true,
-                                tuneBudsManager = tuneBuds,
-                            )
-                            onOpenAiSheet()
-                        }
-                    },
-                    enabled = !geminiBusy,
-                    modifier = Modifier.fillMaxWidth(),
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Button(
+                    onClick = { tuneBuds.takePhoto() },
+                    modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(14.dp),
                 ) {
-                    if (geminiBusy) {
-                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Icon(Icons.Default.CameraAlt, contentDescription = null)
+                    Spacer(Modifier.width(6.dp))
+                    Text("Фото")
+                }
+                Button(
+                    onClick = { tuneBuds.toggleVideo() },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = if (state.isVideoRecording) {
+                        ButtonDefaults.buttonColors(containerColor = Color(0xFFE53935))
                     } else {
-                        Icon(Icons.Default.AutoAwesome, contentDescription = null)
-                    }
-                    Spacer(Modifier.width(8.dp))
-                    Text(if (geminiBusy) "Gemini анализирует кадр..." else "Спросить Gemini по фото с очков")
+                        ButtonDefaults.buttonColors()
+                    },
+                ) {
+                    Icon(
+                        if (state.isVideoRecording) Icons.Default.Stop else Icons.Default.Videocam,
+                        contentDescription = null,
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(if (state.isVideoRecording) "Стоп" else "Видео")
                 }
             }
 
-            actionsContent()
+            OutlinedButton(
+                onClick = {
+                    scope.launch {
+                        gemini.ask(
+                            prompt = "Опиши кратко, что сейчас перед моими глазами.",
+                            withGlassPhoto = true,
+                            tuneBudsManager = tuneBuds,
+                        )
+                        onOpenAiSheet()
+                    }
+                },
+                enabled = !geminiBusy,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+            ) {
+                if (geminiBusy) {
+                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                } else {
+                    Icon(Icons.Default.AutoAwesome, contentDescription = null)
+                }
+                Spacer(Modifier.width(8.dp))
+                Text(if (geminiBusy) "Gemini анализирует кадр..." else "Спросить Gemini по фото с очков")
+            }
 
             // Сетка тумблеров (адаптивная под Fold)
             if (isWide) {
@@ -438,6 +502,73 @@ private fun DeviceTab(
                 }
             }
         }
+    }
+
+    if (showConnectDialog) {
+        val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        val bonded = runCatching { btManager?.adapter?.bondedDevices?.toList().orEmpty() }.getOrDefault(emptyList())
+
+        AlertDialog(
+            onDismissRequest = { showConnectDialog = false },
+            title = { Text("Выбери очки (Bluetooth)") },
+            text = {
+                if (bonded.isEmpty()) {
+                    Text("Нет сопряжённых Bluetooth-устройств или не выдано разрешение Bluetooth.")
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.height(260.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        items(bonded, key = { it.address }) { device ->
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        val name = device.name ?: "TuneBuds"
+                                        prefs.edit()
+                                            .putString("last_mac", device.address)
+                                            .putString("last_name", name)
+                                            .apply()
+                                        tuneBuds.connect(device.address, name)
+                                        showConnectDialog = false
+                                    },
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Text(device.name ?: "Без имени", fontWeight = FontWeight.SemiBold)
+                                    Text(
+                                        device.address,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showConnectDialog = false
+                        runCatching {
+                            context.startActivity(
+                                Intent().setClassName(context, "com.fersaiyan.cyanbridge.ui.DeviceBindActivity"),
+                            )
+                        }.onFailure {
+                            Toast.makeText(context, "Открой ярлык CyanBridge для сканирования", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                ) {
+                    Text("Поиск новых (BLE)")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showConnectDialog = false }) {
+                    Text("Закрыть")
+                }
+            },
+        )
     }
 }
 
@@ -551,7 +682,7 @@ private fun MediaTab(state: TuneBudsState) {
         val columns = if (maxWidth >= 600.dp) 4 else 2
 
         Column(modifier = Modifier.fillMaxSize()) {
-            // Плашка статуса медиа на очках
+            // Плашка статуса медиа и кнопка импорта с очков
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
                 shape = RoundedCornerShape(14.dp),
@@ -559,21 +690,47 @@ private fun MediaTab(state: TuneBudsState) {
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp, vertical = 10.dp),
             ) {
-                Row(
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(12.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    Text(
-                        text = state.mediaCounts?.let {
-                            "На очках: ${it.total} файлов (${it.images} фото, ${it.videos} видео)"
-                        } ?: "Локальные файлы: ${files.size}",
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                    IconButton(onClick = { reloadFiles() }, modifier = Modifier.size(28.dp)) {
-                        Icon(Icons.Default.Refresh, contentDescription = "Обновить список")
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = state.mediaCounts?.let {
+                                "На очках: ${it.total} (${it.images} фото, ${it.videos} видео)"
+                            } ?: "Локальные файлы: ${files.size}",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        IconButton(onClick = { reloadFiles() }, modifier = Modifier.size(28.dp)) {
+                            Icon(Icons.Default.Refresh, contentDescription = "Обновить список")
+                        }
+                    }
+
+                    Button(
+                        onClick = {
+                            runCatching {
+                                context.startActivity(
+                                    Intent().setClassName(
+                                        context,
+                                        "com.fersaiyan.cyanbridge.ui.recordings.SyncedMediaGalleryActivity",
+                                    ),
+                                )
+                            }.onFailure {
+                                Toast.makeText(context, "Не удалось открыть экран импорта", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                    ) {
+                        Icon(Icons.Default.Download, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Импорт с очков (Wi-Fi)")
                     }
                 }
             }
