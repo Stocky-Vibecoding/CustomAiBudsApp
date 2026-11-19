@@ -16,10 +16,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-/**
- * Режим Авто: отключает медиа-аудио (A2DP) на очках, чтобы музыка шла на магнитолу,
- * при этом сохраняя SPP/BLE и голосовой канал для ИИ.
- */
 class CarModeAudioManager private constructor(private val context: Context) {
     companion object {
         private const val TAG = "CarModeAudioManager"
@@ -43,18 +39,9 @@ class CarModeAudioManager private constructor(private val context: Context) {
     val statusMessage: StateFlow<String?> = _statusMessage.asStateFlow()
 
     @SuppressLint("MissingPermission")
-    fun setCarMode(enabled: Boolean, glassesAddress: String?) {
+    fun setCarMode(enabled: Boolean, glassesAddress: String?, glassesName: String? = null) {
         prefs.edit().putBoolean(KEY_CAR_MODE, enabled).apply()
         _isCarModeEnabled.value = enabled
-
-        if (glassesAddress.isNullOrBlank()) {
-            _statusMessage.value = if (enabled) {
-                "Режим Авто включён (применится при подключении очков)"
-            } else {
-                "Режим Авто выключен"
-            }
-            return
-        }
 
         if (!hasBluetoothConnectPermission()) {
             _statusMessage.value = "Нет разрешения BLUETOOTH_CONNECT"
@@ -68,23 +55,21 @@ class CarModeAudioManager private constructor(private val context: Context) {
             return
         }
 
-        val device: BluetoothDevice = runCatching {
-            adapter.getRemoteDevice(glassesAddress.uppercase())
-        }.getOrElse {
-            _statusMessage.value = "Неверный MAC очков: $glassesAddress"
-            return
-        }
-
         adapter.getProfileProxy(
             context,
             object : BluetoothProfile.ServiceListener {
                 override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
                     if (profile == BluetoothProfile.A2DP && proxy is BluetoothA2dp) {
-                        val ok = toggleA2dpProfile(proxy, device, disconnectA2dp = enabled)
-                        _statusMessage.value = when {
-                            ok && enabled -> "Режим Авто: музыка на магнитолу (A2DP очков отключён)"
-                            ok && !enabled -> "Обычный режим: звук снова в очках"
-                            else -> "Система ограничила авто-переключение A2DP — проверь настройки BT"
+                        val target = resolveGlassesDevice(adapter, proxy, glassesAddress, glassesName)
+                        if (target == null) {
+                            _statusMessage.value = "Очки не найдены в профиле A2DP"
+                        } else {
+                            val ok = toggleA2dpProfile(proxy, target, disconnectA2dp = enabled)
+                            _statusMessage.value = when {
+                                ok && enabled -> "Режим Авто: A2DP отключён (${target.name ?: target.address})"
+                                ok && !enabled -> "Обычный режим: звук снова в очках"
+                                else -> "A2DP не переключился (устройство: ${target.name ?: target.address})"
+                            }
                         }
                     }
                     adapter.closeProfileProxy(profile, proxy)
@@ -96,30 +81,71 @@ class CarModeAudioManager private constructor(private val context: Context) {
         )
     }
 
+    @SuppressLint("MissingPermission")
+    private fun resolveGlassesDevice(
+        adapter: BluetoothAdapter,
+        a2dp: BluetoothA2dp,
+        glassesAddress: String?,
+        glassesName: String?,
+    ): BluetoothDevice? {
+        val connected = runCatching { a2dp.connectedDevices }.getOrDefault(emptyList())
+        if (!glassesAddress.isNullOrBlank()) {
+            connected.firstOrNull { it.address.equals(glassesAddress, ignoreCase = true) }?.let { return it }
+        }
+        if (!glassesName.isNullOrBlank()) {
+            connected.firstOrNull {
+                val n = it.name.orEmpty()
+                n.equals(glassesName, ignoreCase = true) || n.contains(glassesName, ignoreCase = true)
+            }?.let { return it }
+        }
+        val bonded = runCatching { adapter.bondedDevices.orEmpty() }.getOrDefault(emptySet())
+        if (!glassesAddress.isNullOrBlank()) {
+            bonded.firstOrNull { it.address.equals(glassesAddress, ignoreCase = true) }?.let { return it }
+        }
+        if (!glassesName.isNullOrBlank()) {
+            bonded.firstOrNull { it.name.orEmpty().contains(glassesName, ignoreCase = true) }?.let { return it }
+        }
+        return connected.firstOrNull()
+    }
+
     private fun toggleA2dpProfile(
         a2dp: BluetoothA2dp,
         device: BluetoothDevice,
         disconnectA2dp: Boolean,
     ): Boolean {
-        return runCatching {
-            // 1. Пробуем setConnectionPolicy (Android 11+)
-            val policyMethod = a2dp.javaClass.getMethod(
-                "setConnectionPolicy",
-                BluetoothDevice::class.java,
-                Int::class.javaPrimitiveType,
-            )
-            // CONNECTION_POLICY_FORBIDDEN = 0, CONNECTION_POLICY_ALLOWED = 100
-            val policy = if (disconnectA2dp) 0 else 100
-            val result = policyMethod.invoke(a2dp, device, policy) as? Boolean ?: false
-            if (result) return true
+        val methodsTried = listOf(
+            {
+                val m = a2dp.javaClass.getMethod(
+                    if (disconnectA2dp) "disconnect" else "connect",
+                    BluetoothDevice::class.java,
+                )
+                m.invoke(a2dp, device) as? Boolean ?: false
+            },
+            {
+                val m = a2dp.javaClass.getMethod(
+                    "setConnectionPolicy",
+                    BluetoothDevice::class.java,
+                    Int::class.javaPrimitiveType,
+                )
+                m.invoke(a2dp, device, if (disconnectA2dp) 0 else 100) as? Boolean ?: false
+            },
+            {
+                val m = a2dp.javaClass.getMethod(
+                    "setPriority",
+                    BluetoothDevice::class.java,
+                    Int::class.javaPrimitiveType,
+                )
+                m.invoke(a2dp, device, if (disconnectA2dp) 0 else 100) as? Boolean ?: false
+            },
+        )
 
-            // 2. Фоллбек через disconnect/connect
-            val methodName = if (disconnectA2dp) "disconnect" else "connect"
-            val actionMethod = a2dp.javaClass.getMethod(methodName, BluetoothDevice::class.java)
-            actionMethod.invoke(a2dp, device) as? Boolean ?: false
-        }.onFailure { err ->
-            Log.w(TAG, "A2DP toggle failed: ${err.message}")
-        }.getOrDefault(false)
+        for (attempt in methodsTried) {
+            val ok = runCatching { attempt() }
+                .onFailure { Log.w(TAG, "A2DP method failed: ${it.message}") }
+                .getOrDefault(false)
+            if (ok) return true
+        }
+        return false
     }
 
     private fun hasBluetoothConnectPermission(): Boolean {
