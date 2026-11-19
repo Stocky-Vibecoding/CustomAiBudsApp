@@ -8,11 +8,13 @@ import android.os.Handler
 import android.os.Looper
 import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsManager
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import okhttp3.ConnectionPool
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
@@ -47,9 +49,12 @@ class TuneBudsWifiImporter private constructor(private val context: Context) {
             }
     }
 
+    // Отключаем пул Keep-Alive соединений — сервер очков закрывает сокет после каждого файла
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .connectionPool(ConnectionPool(0, 1, TimeUnit.SECONDS))
+        .retryOnConnectionFailure(true)
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
         .build()
 
     private val _state = MutableStateFlow(ImportProgressState())
@@ -97,6 +102,7 @@ class TuneBudsWifiImporter private constructor(private val context: Context) {
 
             val targetDir = getMediaDir()
             var downloaded = 0
+            var failedCount = 0
 
             remoteFiles.forEachIndexed { index, remotePath ->
                 val cleanPath = remotePath.trimStart('/')
@@ -121,15 +127,20 @@ class TuneBudsWifiImporter private constructor(private val context: Context) {
                     "$baseUrl/$cleanPath"
                 }
 
-                downloadFile(fileUrl, outFile) { pct ->
+                val ok = downloadFileWithRetry(fileUrl, outFile, maxAttempts = 3) { pct ->
                     _state.value = _state.value.copy(currentFilePercent = pct)
                 }
-                downloaded++
+                if (ok) downloaded++ else failedCount++
+                delay(350L)
             }
 
             _state.value = ImportProgressState(
                 isRunning = false,
-                statusText = "Готово! Скачано: $downloaded (всего на очках: ${remoteFiles.size})",
+                statusText = if (failedCount == 0) {
+                    "Готово! Скачано: $downloaded (всего на очках: ${remoteFiles.size})"
+                } else {
+                    "Скачано: $downloaded, не удалось: $failedCount (нажми ещё раз для докачки)"
+                },
                 downloadedCount = downloaded,
                 totalFiles = remoteFiles.size,
                 currentFileIndex = remoteFiles.size,
@@ -205,7 +216,11 @@ class TuneBudsWifiImporter private constructor(private val context: Context) {
         )
         for (url in candidates) {
             val body = runCatching {
-                val req = Request.Builder().url(url).get().build()
+                val req = Request.Builder()
+                    .url(url)
+                    .header("Connection", "close")
+                    .get()
+                    .build()
                 httpClient.newCall(req).execute().use { resp ->
                     if (resp.isSuccessful) resp.body?.string().orEmpty() else ""
                 }
@@ -222,12 +237,30 @@ class TuneBudsWifiImporter private constructor(private val context: Context) {
         emptyList()
     }
 
+    private suspend fun downloadFileWithRetry(
+        url: String,
+        dest: File,
+        maxAttempts: Int,
+        onPercent: (Int) -> Unit,
+    ): Boolean {
+        repeat(maxAttempts) { attempt ->
+            val ok = runCatching { downloadFile(url, dest, onPercent) }.isSuccess
+            if (ok) return true
+            if (attempt < maxAttempts - 1) delay(700L)
+        }
+        return false
+    }
+
     private suspend fun downloadFile(
         url: String,
         dest: File,
         onPercent: (Int) -> Unit,
     ) = withContext(Dispatchers.IO) {
-        val req = Request.Builder().url(url).get().build()
+        val req = Request.Builder()
+            .url(url)
+            .header("Connection", "close")
+            .get()
+            .build()
         httpClient.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code} при скачивании ${dest.name}")
             val body = resp.body ?: throw IllegalStateException("Пустой ответ для ${dest.name}")
