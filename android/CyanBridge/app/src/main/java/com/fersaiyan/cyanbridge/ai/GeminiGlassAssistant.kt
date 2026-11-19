@@ -50,7 +50,6 @@ data class GeminiConfig(
     val baseUrl: String = "https://generativelanguage.googleapis.com",
     val model: String = "gemini-2.5-flash",
     val speakResponses: Boolean = true,
-    val autoVisionOnTempleHold: Boolean = false,
 )
 
 data class GeminiChatMessage(
@@ -58,6 +57,11 @@ data class GeminiChatMessage(
     val isUser: Boolean,
     val text: String,
     val hasPhoto: Boolean = false,
+)
+
+private data class GeminiRawResponse(
+    val text: String?,
+    val photoToolQuestion: String?,
 )
 
 class GeminiGlassAssistant private constructor(private val context: Context) {
@@ -68,7 +72,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         private const val KEY_BASE_URL = "base_url"
         private const val KEY_MODEL = "model"
         private const val KEY_SPEAK = "speak_responses"
-        private const val KEY_AUTO_VISION = "auto_vision"
 
         private const val SCO_CONNECT_TIMEOUT_MS = 5_000L
         private const val VOICE_WATCHDOG_MS = 16_000L
@@ -76,12 +79,15 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         private const val OPUS_SILENCE_FINISH_MS = 1_400L
         private const val OPUS_MAX_RECORD_MS = 12_000L
         private const val OPUS_FRAME_SIZE = 80
+        private const val TOOL_CAPTURE_PHOTO = "capture_glasses_photo"
 
         private const val GLASSES_SYSTEM_PROMPT =
             "Ты — голосовой ИИ-ассистент в умных очках. Твои ответы сразу озвучиваются голосом (TTS) прямо в уши пользователю. " +
                 "Отвечай максимально кратко, чётко и по делу (1–3 предложения). " +
                 "Никогда не используй Markdown, звёздочки, решётки, тире для списков, эмодзи и любые лишние символы — " +
-                "только чистый живой разговорный текст на русском языке."
+                "только чистый живой разговорный текст на русском языке. " +
+                "Если пользователь просит посмотреть, описать, прочитать, перевести или распознать что-то перед глазами — " +
+                "обязательно вызови инструмент capture_glasses_photo."
 
         private val FALLBACK_MODELS = listOf(
             "gemini-2.5-flash-lite",
@@ -97,6 +103,9 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             "что передо мной",
             "сфоткай",
             "сфотографируй",
+            "прочитай",
+            "переведи это",
+            "что это перед",
         )
 
         @Volatile
@@ -161,7 +170,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             .putString(KEY_BASE_URL, cleaned.baseUrl)
             .putString(KEY_MODEL, cleaned.model)
             .putBoolean(KEY_SPEAK, cleaned.speakResponses)
-            .putBoolean(KEY_AUTO_VISION, cleaned.autoVisionOnTempleHold)
             .apply()
         _config.value = cleaned
     }
@@ -214,8 +222,9 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
 
     /**
      * Режим 2 (AI_CHAT_OPEN_OPUS):
-     * Очки сами пишут голос в OPUS (кадры по 80 байт / 20 мс) и шлют по SPP в 0xB2.
-     * Собираем кадры, пакуем в Ogg Opus (audio/ogg) и отправляем напрямую в Gemini.
+     * Очки шлют OPUS (кадры по 80 байт / 20 мс) по SPP в 0xB2.
+     * Пакуем в Ogg Opus и отправляем в Gemini с инструментом capture_glasses_photo:
+     * если пользователь сказал «посмотри / что передо мной», очки автоматически сделают фото.
      */
     private fun startOpusVoiceSession(tuneBudsManager: TuneBudsManager) {
         activeVoiceJob?.cancel()
@@ -250,8 +259,8 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             }
 
             try {
-                // Подтверждаем открытие потока (SpeechSessionImpl.executeOpenCommand -> sendChatState(2))
-                tuneBudsManager.setAiChatStateBlocking(TuneBudsProtocol.AI_CHAT_OPEN_OPUS)
+                // Асинхронное подтверждение открытия потока (как в SpeechSessionImpl.executeOpenCommand)
+                tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_OPEN_OPUS)
 
                 val startedAt = System.currentTimeMillis()
                 while (!stopSignal.isCompleted) {
@@ -267,7 +276,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             } finally {
                 collectorJob.cancel()
                 opusStopSignal = null
-                tuneBudsManager.setAiChatStateBlocking(TuneBudsProtocol.AI_CHAT_CLOSE)
+                tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_CLOSE)
             }
 
             if (frames.isEmpty()) {
@@ -283,7 +292,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             askWithNativeAudio(
                 audioBytes = oggBytes,
                 audioMime = "audio/ogg",
-                withGlassPhoto = _config.value.autoVisionOnTempleHold,
                 tuneBudsManager = tuneBudsManager,
             )
         }
@@ -291,7 +299,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
 
     /**
      * Режим 1 (AI_CHAT_OPEN_SCO) или системный HFP VOICE_COMMAND:
-     * Поднимает Bluetooth SCO через BroadcastReceiver (как в ScoReader.java) без гаданий по delay.
+     * Поднимает Bluetooth SCO по системному BroadcastReceiver (как в ScoReader.java).
      */
     private fun startScoVoiceSession(tuneBudsManager: TuneBudsManager, confirmWithGlasses: Boolean) {
         activeVoiceJob?.cancel()
@@ -305,7 +313,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 val msg = "Нет разрешения на микрофон"
                 _lastTempleLog.value = msg
                 appendMessage(isUser = false, text = msg)
-                if (confirmWithGlasses) tuneBudsManager.setAiChatStateBlocking(TuneBudsProtocol.AI_CHAT_CLOSE)
+                if (confirmWithGlasses) tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_CLOSE)
                 return@launch
             }
 
@@ -313,7 +321,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             tts?.stop()
 
             if (confirmWithGlasses) {
-                tuneBudsManager.setAiChatStateBlocking(TuneBudsProtocol.AI_CHAT_OPEN_SCO)
+                tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_OPEN_SCO)
             }
 
             val scoReady = openScoAndAwaitConnected()
@@ -389,8 +397,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                             }
 
                             val lower = spoken.lowercase(Locale("ru", "RU"))
-                            val wantsPhoto = _config.value.autoVisionOnTempleHold ||
-                                VISION_TRIGGERS.any { lower.contains(it) }
+                            val wantsPhoto = VISION_TRIGGERS.any { lower.contains(it) }
 
                             _lastTempleLog.value = if (wantsPhoto) "Запрос с фото: «$spoken»" else "Запрос: «$spoken»"
                             scope.launch {
@@ -555,18 +562,51 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         }
 
         _isBusy.value = true
-        appendMessage(isUser = true, text = prompt, hasPhoto = withGlassPhoto)
+        val lower = prompt.lowercase(Locale("ru", "RU"))
+        val eagerPhoto = withGlassPhoto || VISION_TRIGGERS.any { lower.contains(it) }
+        appendMessage(isUser = true, text = prompt, hasPhoto = eagerPhoto)
 
         return try {
-            val photoBytes = if (withGlassPhoto && tuneBudsManager != null && tuneBudsManager.isConnected()) {
-                tuneBudsManager.capturePhotoForAi(timeoutMs = 15_000L)
+            val canUseGlasses = tuneBudsManager != null && tuneBudsManager.isConnected()
+            val initialPhoto = if (eagerPhoto && canUseGlasses) {
+                _lastTempleLog.value = "Делаю фото с очков..."
+                tuneBudsManager!!.capturePhotoForAi(timeoutMs = 15_000L)
             } else {
                 null
             }
 
-            val rawReply = sendGeminiWithFallback(cfg, prompt, photoBytes, null, null)
-            val cleanReply = cleanForSpeech(rawReply)
+            val firstResp = sendGeminiWithFallback(
+                cfg = cfg,
+                prompt = prompt,
+                jpegBytes = initialPhoto,
+                audioBytes = null,
+                audioMime = null,
+                allowPhotoTool = initialPhoto == null && canUseGlasses,
+            )
+
+            val finalText = if (firstResp.photoToolQuestion != null && canUseGlasses) {
+                _lastTempleLog.value = "Делаю фото с очков по запросу..."
+                val snappedPhoto = tuneBudsManager!!.capturePhotoForAi(timeoutMs = 15_000L)
+                if (snappedPhoto != null && snappedPhoto.isNotEmpty()) {
+                    val secondResp = sendGeminiWithFallback(
+                        cfg = cfg,
+                        prompt = firstResp.photoToolQuestion.ifBlank { prompt },
+                        jpegBytes = snappedPhoto,
+                        audioBytes = null,
+                        audioMime = null,
+                        allowPhotoTool = false,
+                    )
+                    secondResp.text ?: "Модель вернула пустой текст."
+                } else {
+                    "Не удалось получить фото с очков."
+                }
+            } else {
+                firstResp.text ?: "Модель вернула пустой текст."
+            }
+
+            val cleanReply = cleanForSpeech(finalText)
             appendMessage(isUser = false, text = cleanReply)
+            _lastTempleLog.value = "Ответ получен"
             if (cfg.speakResponses) {
                 speak(cleanReply)
             }
@@ -574,6 +614,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         } catch (error: Throwable) {
             val errText = "Ошибка Gemini: ${error.message ?: "нет ответа"}"
             Log.e(TAG, errText, error)
+            _lastTempleLog.value = errText
             appendMessage(isUser = false, text = errText)
             errText
         } finally {
@@ -584,7 +625,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
     private suspend fun askWithNativeAudio(
         audioBytes: ByteArray,
         audioMime: String,
-        withGlassPhoto: Boolean,
         tuneBudsManager: TuneBudsManager,
     ) {
         val cfg = _config.value
@@ -595,23 +635,47 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             return
         }
 
-        appendMessage(isUser = true, text = "[Голосовой запрос с очков]", hasPhoto = withGlassPhoto)
-
         try {
-            val photoBytes = if (withGlassPhoto && tuneBudsManager.isConnected()) {
-                tuneBudsManager.capturePhotoForAi(timeoutMs = 15_000L)
-            } else {
-                null
-            }
-
-            val rawReply = sendGeminiWithFallback(
+            val canUseGlasses = tuneBudsManager.isConnected()
+            val firstResp = sendGeminiWithFallback(
                 cfg = cfg,
-                prompt = "Выслушай голосовой запрос пользователя в прикреплённом аудио и ответь кратко и по делу.",
-                jpegBytes = photoBytes,
+                prompt = "Выслушай голосовой запрос пользователя в прикреплённом аудио. " +
+                    "Если он просит посмотреть, описать, прочитать или распознать что-то перед глазами — вызови capture_glasses_photo. " +
+                    "Иначе сразу ответь кратко и по делу.",
+                jpegBytes = null,
                 audioBytes = audioBytes,
                 audioMime = audioMime,
+                allowPhotoTool = canUseGlasses,
             )
-            val cleanReply = cleanForSpeech(rawReply)
+
+            val finalText = if (firstResp.photoToolQuestion != null) {
+                val question = firstResp.photoToolQuestion.ifBlank { "Опиши кратко, что сейчас передо мной." }
+                appendMessage(isUser = true, text = question, hasPhoto = true)
+                _lastTempleLog.value = "Делаю фото с очков..."
+                val photoBytes = if (canUseGlasses) {
+                    tuneBudsManager.capturePhotoForAi(timeoutMs = 15_000L)
+                } else {
+                    null
+                }
+                if (photoBytes != null && photoBytes.isNotEmpty()) {
+                    val secondResp = sendGeminiWithFallback(
+                        cfg = cfg,
+                        prompt = question,
+                        jpegBytes = photoBytes,
+                        audioBytes = null,
+                        audioMime = null,
+                        allowPhotoTool = false,
+                    )
+                    secondResp.text ?: "Модель вернула пустой текст."
+                } else {
+                    "Не удалось сделать фото с очков."
+                }
+            } else {
+                appendMessage(isUser = true, text = "[Голосовой запрос с очков]", hasPhoto = false)
+                firstResp.text ?: "Модель вернула пустой текст."
+            }
+
+            val cleanReply = cleanForSpeech(finalText)
             appendMessage(isUser = false, text = cleanReply)
             _lastTempleLog.value = "Ответ получен"
             if (cfg.speakResponses) {
@@ -633,7 +697,8 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         jpegBytes: ByteArray?,
         audioBytes: ByteArray?,
         audioMime: String?,
-    ): String {
+        allowPhotoTool: Boolean,
+    ): GeminiRawResponse {
         val modelsToTry = (listOf(cfg.model) + FALLBACK_MODELS).distinct()
         var lastError: Throwable? = null
 
@@ -641,7 +706,14 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             val attempts = if (index == 0) 2 else 1
             repeat(attempts) { attempt ->
                 try {
-                    return sendGeminiRequest(cfg.copy(model = modelName), prompt, jpegBytes, audioBytes, audioMime)
+                    return sendGeminiRequest(
+                        cfg = cfg.copy(model = modelName),
+                        prompt = prompt,
+                        jpegBytes = jpegBytes,
+                        audioBytes = audioBytes,
+                        audioMime = audioMime,
+                        allowPhotoTool = allowPhotoTool,
+                    )
                 } catch (err: Throwable) {
                     lastError = err
                     val msg = err.message.orEmpty()
@@ -661,7 +733,8 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         jpegBytes: ByteArray?,
         audioBytes: ByteArray?,
         audioMime: String?,
-    ): String = withContext(Dispatchers.IO) {
+        allowPhotoTool: Boolean,
+    ): GeminiRawResponse = withContext(Dispatchers.IO) {
         val url = "${cfg.baseUrl}/v1beta/models/${cfg.model}:generateContent?key=${cfg.apiKey}"
 
         val systemInstruction = JSONObject().put(
@@ -693,14 +766,46 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             }
         }
 
-        val bodyJson = JSONObject()
+        val bodyObj = JSONObject()
             .put("system_instruction", systemInstruction)
             .put("contents", JSONArray().put(JSONObject().put("parts", parts)))
-            .toString()
+
+        if (allowPhotoTool) {
+            val photoTool = JSONObject()
+                .put("name", TOOL_CAPTURE_PHOTO)
+                .put(
+                    "description",
+                    "Сделать снимок с камеры умных очков. Вызывай ТОЛЬКО если пользователь просит посмотреть, описать, прочитать, перевести или распознать что-то перед глазами (например: посмотри, глянь, что это, прочитай, переведи).",
+                )
+                .put(
+                    "parameters",
+                    JSONObject()
+                        .put("type", "OBJECT")
+                        .put(
+                            "properties",
+                            JSONObject().put(
+                                "user_question",
+                                JSONObject()
+                                    .put("type", "STRING")
+                                    .put("description", "Краткий вопрос пользователя на русском языке"),
+                            ),
+                        )
+                        .put("required", JSONArray().put("user_question")),
+                )
+            bodyObj.put(
+                "tools",
+                JSONArray().put(
+                    JSONObject().put(
+                        "function_declarations",
+                        JSONArray().put(photoTool),
+                    ),
+                ),
+            )
+        }
 
         val request = Request.Builder()
             .url(url)
-            .post(bodyJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .post(bodyObj.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
             .build()
 
         httpClient.newCall(request).execute().use { response ->
@@ -711,14 +816,32 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             val root = JSONObject(rawBody)
             val candidates = root.optJSONArray("candidates")
                 ?: throw IllegalStateException("Пустой ответ от модели")
-            val text = candidates
+            val respParts = candidates
                 .optJSONObject(0)
                 ?.optJSONObject("content")
                 ?.optJSONArray("parts")
-                ?.optJSONObject(0)
-                ?.optString("text")
-                ?.trim()
-            if (text.isNullOrBlank()) "Модель вернула пустой текст." else text
+                ?: return@withContext GeminiRawResponse(text = null, photoToolQuestion = null)
+
+            var photoQuestion: String? = null
+            val textParts = ArrayList<String>()
+
+            for (i in 0 until respParts.length()) {
+                val part = respParts.optJSONObject(i) ?: continue
+                val fnCall = part.optJSONObject("functionCall") ?: part.optJSONObject("function_call")
+                if (fnCall != null && fnCall.optString("name") == TOOL_CAPTURE_PHOTO) {
+                    val args = fnCall.optJSONObject("args")
+                    photoQuestion = args?.optString("user_question")?.trim().orEmpty()
+                }
+                val t = part.optString("text").trim()
+                if (t.isNotEmpty()) {
+                    textParts += t
+                }
+            }
+
+            GeminiRawResponse(
+                text = textParts.joinToString(" ").ifBlank { null },
+                photoToolQuestion = photoQuestion,
+            )
         }
     }
 
@@ -744,16 +867,14 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             .ifBlank { "https://generativelanguage.googleapis.com" },
         model = prefs.getString(KEY_MODEL, "gemini-2.5-flash").orEmpty().ifBlank { "gemini-2.5-flash" },
         speakResponses = prefs.getBoolean(KEY_SPEAK, true),
-        autoVisionOnTempleHold = prefs.getBoolean(KEY_AUTO_VISION, false),
     )
 }
 
 /**
- * Стандартный упаковщик сырых 20ms OPUS-кадров (0xB2) в контейнер Ogg Opus (RFC 7845 + RFC 3533)
- * для прямой отправки в Gemini (audio/ogg) без нативных библиотек.
+ * Стандартный упаковщик сырых 20ms OPUS-кадров (0xB2) в контейнер Ogg Opus (RFC 7845 + RFC 3533).
  */
 private object OggOpusMuxer {
-    private const val STREAM_SERIAL = 0x54425544 // "TBUD"
+    private const val STREAM_SERIAL = 0x54425544
     private const val SAMPLES_PER_20MS_48K = 960L
     private const val FRAMES_PER_PAGE = 50
 
@@ -771,20 +892,18 @@ private object OggOpusMuxer {
         val out = ByteArrayOutputStream(frames.size * 85 + 256)
         var pageSeq = 0
 
-        // Страница 0 (BOS): OpusHead (19 байт, 1 канал, 16kHz input, pre-skip 312)
         val opusHead = byteArrayOf(
             'O'.code.toByte(), 'p'.code.toByte(), 'u'.code.toByte(), 's'.code.toByte(),
             'H'.code.toByte(), 'e'.code.toByte(), 'a'.code.toByte(), 'd'.code.toByte(),
-            1, // version
-            1, // channels
-            0x38, 0x01, // pre-skip = 312 LE
-            0x80.toByte(), 0x3E, 0x00, 0x00, // input sample rate = 16000 LE
-            0x00, 0x00, // output gain = 0
-            0x00, // channel mapping family = 0
+            1,
+            1,
+            0x38, 0x01,
+            0x80.toByte(), 0x3E, 0x00, 0x00,
+            0x00, 0x00,
+            0x00,
         )
         writePage(out, listOf(opusHead), headerType = 0x02, granule = 0L, seq = pageSeq++)
 
-        // Страница 1: OpusTags
         val vendor = "AiBuds".toByteArray(StandardCharsets.UTF_8)
         val opusTags = ByteArrayOutputStream(16 + vendor.size).apply {
             write("OpusTags".toByteArray(StandardCharsets.US_ASCII))
@@ -794,7 +913,6 @@ private object OggOpusMuxer {
         }.toByteArray()
         writePage(out, listOf(opusTags), headerType = 0x00, granule = 0L, seq = pageSeq++)
 
-        // Аудио-страницы
         var granule = 0L
         var offset = 0
         while (offset < frames.size) {
@@ -844,7 +962,6 @@ private object OggOpusMuxer {
         putLongLe(page, 6, granule)
         putIntLe(page, 14, STREAM_SERIAL)
         putIntLe(page, 18, seq)
-        // CRC (22..25) оставляем нулями перед расчётом
         page[26] = segBytes.size.toByte()
         System.arraycopy(segBytes, 0, page, 27, segBytes.size)
 
