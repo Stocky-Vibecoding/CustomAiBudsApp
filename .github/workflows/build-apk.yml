@@ -6,6 +6,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
 
     steps:
       - name: Checkout repository
@@ -24,11 +27,11 @@ jobs:
         with:
           gradle-version: '8.13'
 
-      - name: Find and Build Debug APK
+      - name: Build Debug APK
+        working-directory: android/CyanBridge
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          GRADLE_DIR=$(dirname $(find ./android -maxdepth 3 -name "settings.gradle*" | head -n 1))
-          echo "Found Gradle project in: $GRADLE_DIR"
-          cd "$GRADLE_DIR"
           if [ -f "./gradlew" ]; then
             chmod +x gradlew
             ./gradlew :app:assembleDebug
@@ -40,4 +43,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: custom-aibuds-debug-apk
-          path: "android/**/build/outputs/apk/debug/*.apk"
+          path: android/CyanBridge/app/build/outputs/apk/debug/*.apk
