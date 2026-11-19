@@ -265,6 +265,14 @@ class TuneBudsManager private constructor(context: Context) {
         requireSuccess(request(TuneBudsProtocol.CMD_STORAGE))
     }
 
+    fun formatStorage() = launchCommand("format storage") {
+        requireSuccess(request(TuneBudsProtocol.CMD_FORMAT_STORAGE))
+        runCatching {
+            request(TuneBudsProtocol.CMD_STORAGE)
+            request(TuneBudsProtocol.CMD_MEDIA_COUNTS)
+        }
+    }
+
     fun requestMediaCount() = launchCommand("read media count") {
         requireSuccess(request(TuneBudsProtocol.CMD_MEDIA_COUNTS))
     }
