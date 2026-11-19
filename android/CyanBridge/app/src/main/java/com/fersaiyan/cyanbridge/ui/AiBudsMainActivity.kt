@@ -115,8 +115,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.ColorFilter
-import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -130,7 +128,6 @@ import com.fersaiyan.cyanbridge.ai.CarModeAudioManager
 import com.fersaiyan.cyanbridge.ai.GeminiConfig
 import com.fersaiyan.cyanbridge.ai.GeminiGlassAssistant
 import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsManager
-import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsProtocol
 import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsState
 import com.fersaiyan.cyanbridge.media.ColorPreset
 import com.fersaiyan.cyanbridge.media.MediaProcessingOptions
@@ -145,6 +142,7 @@ import java.io.File
 
 class AiBudsMainActivity : ComponentActivity() {
     private lateinit var tuneBuds: TuneBudsManager
+    private lateinit var gemini: GeminiGlassAssistant
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -167,8 +165,12 @@ class AiBudsMainActivity : ComponentActivity() {
 
         tuneBuds = TuneBudsManager.getInstance(applicationContext)
         val carMode = CarModeAudioManager.getInstance(applicationContext)
-        val gemini = GeminiGlassAssistant.getInstance(applicationContext)
+        gemini = GeminiGlassAssistant.getInstance(applicationContext)
         gemini.bindToGlasses(tuneBuds)
+
+        if (intent?.action == Intent.ACTION_VOICE_COMMAND) {
+            gemini.triggerFromVoiceButton(tuneBuds)
+        }
 
         setContent {
             MaterialTheme(
@@ -186,6 +188,14 @@ class AiBudsMainActivity : ComponentActivity() {
                     gemini = gemini,
                 )
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.action == Intent.ACTION_VOICE_COMMAND && ::gemini.isInitialized && ::tuneBuds.isInitialized) {
+            gemini.triggerFromVoiceButton(tuneBuds)
         }
     }
 
@@ -747,7 +757,6 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
 
         Column(modifier = Modifier.fillMaxSize()) {
             if (selectionMode) {
-                // Панель массового удаления выбранных файлов
                 Card(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)),
                     shape = RoundedCornerShape(14.dp),
@@ -931,7 +940,6 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
         }
     }
 
-    // Шторка предпросмотра и экспорта фото/видео
     selectedFile?.let { file ->
         val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         ModalBottomSheet(
@@ -939,6 +947,7 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
             sheetState = sheetState,
         ) {
             val isVideo = file.extension.equals("mp4", ignoreCase = true)
+            var videoColorPreviewMode by remember(file.absolutePath) { mutableStateOf(false) }
             var showOriginalPreview by remember(file.absolutePath) { mutableStateOf(false) }
 
             Column(
@@ -975,23 +984,50 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
                     }
                 }
 
-                // Предпросмотр видео или фото
                 if (isVideo) {
-                    InlineVideoPlayer(
-                        file = file,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 200.dp, max = 300.dp),
-                    )
+                    if (videoColorPreviewMode) {
+                        ExactGradeFramePreview(
+                            file = file,
+                            isVideo = true,
+                            processor = processor,
+                            preset = if (showOriginalPreview) ColorPreset.ORIGINAL else options.colorPreset,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 200.dp, max = 300.dp),
+                        )
+                    } else {
+                        InlineVideoPlayer(
+                            file = file,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 200.dp, max = 300.dp),
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        TextButton(onClick = { videoColorPreviewMode = !videoColorPreviewMode }) {
+                            Text(if (videoColorPreviewMode) "Вернуть плеер" else "Превью цвета на кадре")
+                        }
+                        if (videoColorPreviewMode && options.colorPreset != ColorPreset.ORIGINAL) {
+                            TextButton(onClick = { showOriginalPreview = !showOriginalPreview }) {
+                                Text(if (showOriginalPreview) "С обработкой" else "Оригинал")
+                            }
+                        }
+                    }
                 } else {
-                    PhotoLivePreview(
+                    ExactGradeFramePreview(
                         file = file,
-                        preset = if (showOriginalPreview) ColorPreset.entries.first() else options.colorPreset,
+                        isVideo = false,
+                        processor = processor,
+                        preset = if (showOriginalPreview) ColorPreset.ORIGINAL else options.colorPreset,
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(min = 200.dp, max = 300.dp),
                     )
-                    if (options.colorPreset != ColorPreset.entries.first()) {
+                    if (options.colorPreset != ColorPreset.ORIGINAL) {
                         TextButton(
                             onClick = { showOriginalPreview = !showOriginalPreview },
                             modifier = Modifier.align(Alignment.End),
@@ -1001,7 +1037,7 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
                     }
                 }
 
-                Text("Цветокоррекция", style = MaterialTheme.typography.labelLarge)
+                Text("Обработка цвета и шумов", style = MaterialTheme.typography.labelLarge)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                     ColorPreset.entries.forEach { preset ->
                         FilterChip(
@@ -1030,7 +1066,7 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
                             checked = options.stabilize,
                             onCheckedChange = { options = options.copy(stabilize = it) },
                         )
-                        Text("Стабилизация (кроп 6%)")
+                        Text("Стабилизация видео (EIS)")
                     }
                 }
 
@@ -1236,44 +1272,43 @@ private fun InlineVideoPlayer(file: File, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun PhotoLivePreview(
+private fun ExactGradeFramePreview(
     file: File,
+    isVideo: Boolean,
+    processor: MetaVideoProcessor,
     preset: ColorPreset,
     modifier: Modifier = Modifier,
 ) {
-    val bmp by produceState<Bitmap?>(initialValue = null, key1 = file.absolutePath) {
+    val baseBmp by produceState<Bitmap?>(initialValue = null, key1 = file.absolutePath, key2 = isVideo) {
         value = withContext(Dispatchers.IO) {
             runCatching {
-                val opts = BitmapFactory.Options().apply { inSampleSize = 2 }
-                BitmapFactory.decodeFile(file.absolutePath, opts)
+                if (isVideo) {
+                    val mmr = MediaMetadataRetriever()
+                    try {
+                        mmr.setDataSource(file.absolutePath)
+                        mmr.getFrameAtTime(1_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                            ?: mmr.getFrameAtTime(0L)
+                    } finally {
+                        runCatching { mmr.release() }
+                    }
+                } else {
+                    val opts = BitmapFactory.Options().apply { inSampleSize = 2 }
+                    BitmapFactory.decodeFile(file.absolutePath, opts)
+                }
             }.getOrNull()
         }
     }
 
-    val colorFilter = remember(preset) {
-        val idx = ColorPreset.entries.indexOf(preset)
-        when (idx) {
-            1 -> ColorFilter.colorMatrix(
-                ColorMatrix(
-                    floatArrayOf(
-                        1.06f, 0f, 0f, 0f, 2f,
-                        0f, 1.05f, 0f, 0f, 1f,
-                        0f, 0f, 1.03f, 0f, 0f,
-                        0f, 0f, 0f, 1f, 0f,
-                    ),
-                ),
-            )
-            2 -> ColorFilter.colorMatrix(
-                ColorMatrix(
-                    floatArrayOf(
-                        1.05f, 0f, 0f, 0f, 8f,
-                        0f, 1.05f, 0f, 0f, 8f,
-                        0f, 0f, 1.05f, 0f, 8f,
-                        0f, 0f, 0f, 1f, 0f,
-                    ),
-                ),
-            )
-            else -> null
+    val gradedBmp by produceState<Bitmap?>(initialValue = null, key1 = baseBmp, key2 = preset) {
+        val src = baseBmp ?: return@produceState
+        value = if (preset == ColorPreset.ORIGINAL) {
+            src
+        } else {
+            withContext(Dispatchers.Default) {
+                runCatching {
+                    processor.applyPhotoEffects(src, MediaProcessingOptions(colorPreset = preset))
+                }.getOrDefault(src)
+            }
         }
     }
 
@@ -1283,15 +1318,17 @@ private fun PhotoLivePreview(
             .background(Color.Black),
         contentAlignment = Alignment.Center,
     ) {
-        bmp?.let { image ->
+        val display = gradedBmp ?: baseBmp
+        if (display != null) {
             Image(
-                bitmap = image.asImageBitmap(),
+                bitmap = display.asImageBitmap(),
                 contentDescription = file.name,
                 contentScale = ContentScale.Fit,
-                colorFilter = colorFilter,
                 modifier = Modifier.fillMaxSize(),
             )
-        } ?: CircularProgressIndicator(modifier = Modifier.size(28.dp))
+        } else {
+            CircularProgressIndicator(modifier = Modifier.size(28.dp))
+        }
     }
 }
 
@@ -1411,7 +1448,6 @@ private fun SettingsSheetContent(
     ) {
         Text("Настройки", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
 
-        // Раздел 1: Жесты тачпада (перенесён с главного экрана)
         Text("Управление тачпадом", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1447,26 +1483,8 @@ private fun SettingsSheetContent(
             )
         }
 
-        // Тонкая настройка 1× тапа отдельно
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text("Одинарный тап:", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
-            TextButton(
-                onClick = { tuneBuds.setTapGesture(1, TuneBudsProtocol.KEY_FUNC_PLAY_PAUSE) },
-                enabled = glassState.protocolState == "CONNECTED",
-            ) { Text("Пауза") }
-            TextButton(
-                onClick = { tuneBuds.setTapGesture(1, TuneBudsProtocol.KEY_FUNC_NONE) },
-                enabled = glassState.protocolState == "CONNECTED",
-            ) { Text("Выкл") }
-        }
-
         HorizontalDivider()
 
-        // Раздел 2: Настройки Gemini
         Text("Ассистент Gemini", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
 
         OutlinedTextField(
@@ -1532,6 +1550,13 @@ private fun SettingsSheetContent(
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.secondary,
         )
+        glassState.lastIncomingPacket?.let { pkt ->
+            Text(
+                text = "Пакет очков: $pkt",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
 
         HorizontalDivider()
 
