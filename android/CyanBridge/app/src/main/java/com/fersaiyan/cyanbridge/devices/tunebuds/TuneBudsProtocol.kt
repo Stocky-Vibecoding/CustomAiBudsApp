@@ -54,8 +54,9 @@ object TuneBudsProtocol {
     const val DEFAULT_MAX_PACKET_SIZE = 20
     const val HEADER_SIZE = 5
 
-    const val CMD_DEVICE_INFO = 0x27
+    const val CMD_KEY = 0x22
     const val CMD_SET_DETECTION = 0x26
+    const val CMD_DEVICE_INFO = 0x27
     const val CMD_AI_CHAT_STATE = 0xB0
     const val CMD_AI_RECORD_STATE = 0xB1
     const val CMD_AI_RECORD_DATA = 0xB2
@@ -82,6 +83,21 @@ object TuneBudsProtocol {
 
     const val CONFIG_VIDEO_LIMIT_TIME = 0x82
     const val CONFIG_AUDIO_LIMIT_TIME = 0x83
+
+    const val KEY_LEFT_SINGLE = 1
+    const val KEY_RIGHT_SINGLE = 2
+    const val KEY_LEFT_DOUBLE = 3
+    const val KEY_RIGHT_DOUBLE = 4
+    const val KEY_LEFT_TRIPLE = 5
+    const val KEY_RIGHT_TRIPLE = 6
+
+    const val KEY_FUNC_NONE = 0
+    const val KEY_FUNC_ASSISTANT = 2
+    const val KEY_FUNC_PREV = 3
+    const val KEY_FUNC_NEXT = 4
+    const val KEY_FUNC_VOL_UP = 5
+    const val KEY_FUNC_VOL_DOWN = 6
+    const val KEY_FUNC_PLAY_PAUSE = 7
 
     const val INFO_BATTERY = 0x01
     const val INFO_FIRMWARE_VERSION = 0x02
@@ -288,6 +304,9 @@ object TuneBudsProtocol {
         )
     }
 
+    fun buildKeyPayload(keyType: Int, keyFunction: Int): ByteArray =
+        byteArrayOf(keyType.toByte(), 0x01, keyFunction.toByte())
+
     fun rtspQualityPayload(quality: Int): ByteArray = when (quality) {
         in 0..24 -> byteArrayOf(0x01, 0x1E, 0x3C)
         in 25..49 -> byteArrayOf(0x02, 0x14, 0x1E)
@@ -386,7 +405,7 @@ class TuneBudsFrameDecoder {
         val fragment = frame[3].toInt() and 0xFF
         val total = ((fragment ushr 4) and 0x0F) + 1
         val index = fragment and 0x0F
-        require(index < total) { "TuneBuds fragment index $index is outside total $total" }
+        require(index < total) { "TuneBuds fragment index $index is outside total$total" }
         val payload = frame.copyOfRange(TuneBudsProtocol.HEADER_SIZE, frame.size)
 
         var current = assembly
