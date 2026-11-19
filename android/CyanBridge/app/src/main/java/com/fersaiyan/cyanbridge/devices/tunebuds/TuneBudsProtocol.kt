@@ -56,6 +56,10 @@ object TuneBudsProtocol {
 
     const val CMD_DEVICE_INFO = 0x27
     const val CMD_SET_DETECTION = 0x26
+    const val CMD_AI_CHAT_STATE = 0xB0
+    const val CMD_AI_RECORD_STATE = 0xB1
+    const val CMD_AI_RECORD_DATA = 0xB2
+    const val CMD_AI_ENVELOPE = 0x55AA
     const val CMD_CAMERA_COPROCESSOR_INFO = 0xE0
     const val CMD_CAMERA_ON = 0xE1
     const val CMD_CAMERA_CLOSE = 0xE2
@@ -74,6 +78,9 @@ object TuneBudsProtocol {
     const val CMD_GLASS_CONFIG = 0xF7
     const val CMD_TELEPROMPTER = 0xF8
     const val CMD_TELEPROMPTER_CONTROL = 0xFB
+
+    const val CONFIG_VIDEO_LIMIT_TIME = 0x82
+    const val CONFIG_AUDIO_LIMIT_TIME = 0x83
 
     const val INFO_BATTERY = 0x01
     const val INFO_FIRMWARE_VERSION = 0x02
@@ -272,6 +279,17 @@ object TuneBudsProtocol {
         return byteArrayOf(key.toByte(), value.size.toByte()) + value
     }
 
+    fun buildVideoLimitPayload(seconds: Int): ByteArray {
+        val clamped = seconds.coerceIn(15, 720)
+        return buildConfigPayload(
+            CONFIG_VIDEO_LIMIT_TIME,
+            byteArrayOf(
+                (clamped and 0xFF).toByte(),
+                ((clamped ushr 8) and 0xFF).toByte(),
+            ),
+        )
+    }
+
     fun rtspQualityPayload(quality: Int): ByteArray = when (quality) {
         in 0..24 -> byteArrayOf(0x01, 0x1E, 0x3C)
         in 25..49 -> byteArrayOf(0x02, 0x14, 0x1E)
@@ -316,6 +334,15 @@ class TuneBudsFrameDecoder {
             if (isAiEnvelopeStart(buffered, cursor)) {
                 val end = findAiEnvelopeEnd(buffered, cursor + 2)
                 if (end < 0) break
+                val rawEnvelope = buffered.copyOfRange(cursor, end + 2)
+                completed.add(
+                    TuneBudsFrame(
+                        sequence = 0,
+                        command = TuneBudsProtocol.CMD_AI_ENVELOPE,
+                        type = TuneBudsFrameType.NOTIFICATION,
+                        payload = rawEnvelope,
+                    ),
+                )
                 cursor = end + 2
                 continue
             }
@@ -353,9 +380,6 @@ class TuneBudsFrameDecoder {
     private fun acceptPhysicalFrame(frame: ByteArray, type: TuneBudsFrameType): TuneBudsFrame? {
         val sequence = frame[0].toInt() and 0x0F
         expectedSequence?.let { expected ->
-            // The official AB Mate decoder reports transport-sequence gaps but still consumes
-            // the frame. AI envelopes share the RFCOMM stream but bypass this decoder, so
-            // rejecting the next command frame would drop valid photo chunks or responses.
             if (sequence != expected) malformedFrameCount++
         }
         expectedSequence = (sequence + 1) and 0x0F
