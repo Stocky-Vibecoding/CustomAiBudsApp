@@ -95,6 +95,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -113,7 +114,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -123,6 +123,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -405,7 +406,7 @@ private fun DeviceTab(
                                     Icons.Default.BatteryStd
                                 },
                                 contentDescription = null,
-                                tint = if (isConnected && state.batteryPercent != null) {
+                                tint = if (isConnected) {
                                     MaterialTheme.colorScheme.secondary
                                 } else {
                                     MaterialTheme.colorScheme.onSurfaceVariant
@@ -413,7 +414,11 @@ private fun DeviceTab(
                             )
                             Spacer(Modifier.width(4.dp))
                             Text(
-                                text = if (isConnected) state.batteryPercent?.let { "$it%" } ?: "--%" else "--%",
+                                text = if (isConnected) {
+                                    state.batteryPercent?.let { "$it%" } ?: "--%"
+                                } else {
+                                    "--%"
+                                },
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.SemiBold,
                             )
@@ -432,7 +437,7 @@ private fun DeviceTab(
                             ) {
                                 Icon(Icons.Default.BluetoothConnected, contentDescription = null)
                                 Spacer(Modifier.width(8.dp))
-                                Text("Отключить очки", maxLines = 1, softWrap = false)
+                                Text("Отключить очки", maxLines = 1)
                             }
                         } else {
                             Button(
@@ -444,10 +449,9 @@ private fun DeviceTab(
                                 Icon(Icons.Default.Bluetooth, contentDescription = null)
                                 Spacer(Modifier.width(6.dp))
                                 Text(
-                                    text = if (!savedMac.isNullOrBlank()) "Подключить" else "Подключить очки",
+                                    text = if (savedMac.isNullOrBlank()) "Подключить очки" else "Подключить",
                                     maxLines = 1,
                                     softWrap = false,
-                                    overflow = TextOverflow.Ellipsis,
                                 )
                             }
                             if (!savedMac.isNullOrBlank()) {
@@ -662,30 +666,23 @@ private fun DeviceTab(
                     ) {
                         options.forEach { (sec, label) ->
                             val isSelected = normalizedVideoLimitSec == sec
-                            Box(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(36.dp)
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .background(
-                                        if (isSelected) {
-                                            MaterialTheme.colorScheme.primary.copy(alpha = 0.24f)
-                                        } else {
-                                            MaterialTheme.colorScheme.surfaceVariant
-                                        },
-                                    )
-                                    .border(
-                                        width = 1.dp,
-                                        color = if (isSelected) {
-                                            MaterialTheme.colorScheme.primary
-                                        } else {
-                                            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.25f)
-                                        },
-                                        shape = RoundedCornerShape(10.dp),
-                                    )
-                                    .clickable { tuneBuds.setVideoLimit(sec) }
-                                    .padding(horizontal = 4.dp),
-                                contentAlignment = Alignment.Center,
+                            Surface(
+                                onClick = { tuneBuds.setVideoLimit(sec) },
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (isSelected) {
+                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceVariant
+                                },
+                                border = BorderStroke(
+                                    width = 1.dp,
+                                    color = if (isSelected) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        Color.White.copy(alpha = 0.14f)
+                                    },
+                                ),
+                                modifier = Modifier.weight(1f),
                             ) {
                                 Text(
                                     text = label,
@@ -698,6 +695,10 @@ private fun DeviceTab(
                                     },
                                     maxLines = 1,
                                     softWrap = false,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 4.dp, vertical = 9.dp),
                                 )
                             }
                         }
@@ -1612,31 +1613,15 @@ private fun SettingsSheetContent(
     var speak by remember(cfg) { mutableStateOf(cfg.speakResponses) }
     var promptInput by remember { mutableStateOf("") }
 
-    fun persistIfChanged(draft: GeminiConfig) {
-        val cleaned = draft.copy(
-            apiKey = draft.apiKey.trim(),
-            baseUrl = draft.baseUrl.trim().trimEnd('/').ifBlank {
-                "https://generativelanguage.googleapis.com"
-            },
-            model = draft.model.trim().removePrefix("models/").ifBlank { "gemini-2.5-flash" },
-        )
-        if (cleaned != gemini.config.value) {
-            gemini.updateConfig(cleaned)
-        }
-    }
-
-    val latestDraft by rememberUpdatedState(
-        GeminiConfig(
+    fun applyConfigIfChanged() {
+        val candidate = GeminiConfig(
             apiKey = apiKey,
             baseUrl = baseUrl,
             model = model,
             speakResponses = speak,
-        ),
-    )
-
-    DisposableEffect(Unit) {
-        onDispose {
-            persistIfChanged(latestDraft)
+        )
+        if (candidate != cfg) {
+            gemini.updateConfig(candidate)
         }
     }
 
@@ -1689,7 +1674,7 @@ private fun SettingsSheetContent(
         OutlinedTextField(
             value = model,
             onValueChange = { model = it },
-            label = { Text("Модель (например, gemini-2.5-flash)") },
+            label = { Text("Модель (например, gemini-3-flash-preview)") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
@@ -1705,7 +1690,14 @@ private fun SettingsSheetContent(
 
         Button(
             onClick = {
-                gemini.updateConfig(latestDraft)
+                gemini.updateConfig(
+                    GeminiConfig(
+                        apiKey = apiKey,
+                        baseUrl = baseUrl,
+                        model = model,
+                        speakResponses = speak,
+                    ),
+                )
                 Toast.makeText(context, "Настройки ИИ сохранены!", Toast.LENGTH_SHORT).show()
             },
             modifier = Modifier.fillMaxWidth(),
@@ -1759,7 +1751,7 @@ private fun SettingsSheetContent(
                 onClick = {
                     val q = promptInput.trim()
                     if (q.isNotEmpty() && !isBusy) {
-                        persistIfChanged(latestDraft)
+                        applyConfigIfChanged()
                         promptInput = ""
                         scope.launch { gemini.ask(q, withGlassPhoto = false, tuneBudsManager = tuneBuds) }
                     }
