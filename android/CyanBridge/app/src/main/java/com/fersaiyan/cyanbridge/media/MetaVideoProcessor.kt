@@ -66,8 +66,8 @@ import kotlin.math.tanh
 
 enum class ColorPreset(val label: String) {
     ORIGINAL("Оригинал"),
-    META_DAY("Кино / День"),
-    NIGHT_CAR("Ночь / Авто"),
+    META_DAY("Дневной"),
+    NIGHT_CAR("Ночной"),
 }
 
 data class MediaProcessingOptions(
@@ -224,9 +224,7 @@ class MetaVideoProcessor(private val context: Context) {
         }
     }
 
-    /**
-     * Полный 1-в-1 аналог GPU-шейдера ProCinemaShaderProgram (для фото и точного превью «До / После»).
-     */
+    /** 1-в-1 аналог GPU-шейдера ProCinemaShaderProgram для фото. */
     fun applyPhotoEffects(source: Bitmap, options: MediaProcessingOptions): Bitmap {
         val working = if (options.upscale2K && source.height < 1536) {
             val scale = 1536f / source.height.toFloat()
@@ -300,7 +298,6 @@ class MetaVideoProcessor(private val context: Context) {
                 val yU2 = yArr[iU2]
                 val yD2 = yArr[iD2]
 
-                // 1. Билатеральное подавление цветового шума (только Cb/Cr)
                 val w0 = 1.5f
                 val wL = fastWeight(abs(yL - y0) / sigma)
                 val wR = fastWeight(abs(yR - y0) / sigma)
@@ -322,13 +319,11 @@ class MetaVideoProcessor(private val context: Context) {
                 var cb = cbArr[idx] + (avgCb - cbArr[idx]) * params.chromaDenoise
                 var cr = crArr[idx] + (avgCr - crArr[idx]) * params.chromaDenoise
 
-                // Гасим цветной шум на почти серых стенах/потолках
                 val chromaMag = hypot(cb.toDouble(), cr.toDouble()).toFloat()
                 val neutralKeep = 0.35f + 0.65f * smoothstep(0.012f, 0.045f, chromaMag)
                 cb *= neutralKeep
                 cr *= neutralKeep
 
-                // 2. Резкость (Unsharp Mask с отсечкой шума) + локальный контраст (Clarity 3px)
                 val blur1 = (yL + yR + yU + yD) * 0.25f
                 val detail1 = y0 - blur1
                 val edgeMask = smoothstep(0.008f, 0.030f, abs(detail1))
@@ -341,13 +336,11 @@ class MetaVideoProcessor(private val context: Context) {
 
                 var y = (y0 + sharpDelta + clarityDelta).coerceIn(0f, 1f)
 
-                // 3. Снятие серой пелены (black point) + гамма + киношная S-кривая
                 y = ((y - params.blackCrush) * invDehaze).coerceIn(0f, 1f)
                 y = y.coerceAtLeast(0.0001f).pow(params.gamma)
                 val sCurve = y * y * (3f - 2f * y)
                 y = (y + (sCurve - y) * params.contrast).coerceIn(0f, 1f)
 
-                // 4. Умный Vibrance + деликатный дневной баланс (не красит тени и серый)
                 val vibMask = smoothstep(0.018f, 0.070f, chromaMag) *
                     (1f - smoothstep(0.24f, 0.44f, chromaMag))
                 val satScale = params.baseSat * (1f + params.vibrance * vibMask)
@@ -615,7 +608,6 @@ private class ProCinemaShaderProgram(
                 float yDL3 = dot(texture2D(uTexSampler, vTexCoord + vec2(-3.0 * uTexelSize.x, -3.0 * uTexelSize.y)).rgb, vec3(0.2126, 0.7152, 0.0722));
                 float yDR3 = dot(texture2D(uTexSampler, vTexCoord + vec2( 3.0 * uTexelSize.x, -3.0 * uTexelSize.y)).rgb, vec3(0.2126, 0.7152, 0.0722));
 
-                // 1. Билатеральное подавление цветового шума (Cb/Cr)
                 float sigma = 0.07;
                 float w0 = 1.5;
                 float wL = exp(-abs(yccL.x - ycc0.x) / sigma);
@@ -637,7 +629,6 @@ private class ProCinemaShaderProgram(
                 float neutralKeep = mix(0.35, 1.0, smoothstep(0.012, 0.045, chromaMag));
                 chroma *= neutralKeep;
 
-                // 2. Честный Unsharp Mask + Clarity (3px) без самоблокировки
                 float blur1 = (yccL.x + yccR.x + yccU.x + yccD.x) * 0.25;
                 float detail1 = ycc0.x - blur1;
                 float edgeMask = smoothstep(0.008, 0.030, abs(detail1));
@@ -648,13 +639,11 @@ private class ProCinemaShaderProgram(
 
                 float y = clamp(ycc0.x + sharpDelta + clarityDelta, 0.0, 1.0);
 
-                // 3. Dehaze (точка чёрного) + гамма + S-кривая
                 y = clamp((y - uBlackCrush) / (1.0 - uBlackCrush), 0.0, 1.0);
                 y = pow(max(y, 0.0001), uGamma);
                 float sCurve = y * y * (3.0 - 2.0 * y);
                 y = clamp(mix(y, sCurve, uContrast), 0.0, 1.0);
 
-                // 4. Умный Vibrance + чистый баланс цвета
                 float vibMask = smoothstep(0.018, 0.070, chromaMag) * (1.0 - smoothstep(0.24, 0.44, chromaMag));
                 float satScale = uBaseSat * (1.0 + uVibrance * vibMask);
                 float warmMask = smoothstep(0.18, 0.55, y) * smoothstep(0.018, 0.060, chromaMag);
