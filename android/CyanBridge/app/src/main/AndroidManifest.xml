@@ -37,9 +37,6 @@
 
     <queries>
         <intent>
-            <action android:name="android.speech.RecognitionService" />
-        </intent>
-        <intent>
             <action android:name="android.intent.action.TTS_SERVICE" />
         </intent>
         <package android:name="com.glasssutdio.wear" />
@@ -93,7 +90,7 @@
         </activity>
 
         <service
-            android:name=".devices.tunebuds.AiBudsGlassService"
+            android:name=".devices.tunebuds.AiBudsForegroundService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice|microphone" />
 
