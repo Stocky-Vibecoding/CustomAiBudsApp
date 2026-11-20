@@ -65,6 +65,7 @@ import androidx.compose.material.icons.filled.DirectionsCar
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Headphones
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
@@ -93,6 +94,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -106,6 +108,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -124,11 +127,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.LifecycleOwner
 import com.fersaiyan.cyanbridge.ai.CarModeAudioManager
 import com.fersaiyan.cyanbridge.ai.GeminiConfig
 import com.fersaiyan.cyanbridge.ai.GeminiGlassAssistant
 import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsManager
-import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsProtocol
 import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsState
 import com.fersaiyan.cyanbridge.media.ColorPreset
 import com.fersaiyan.cyanbridge.media.MediaProcessingOptions
@@ -140,6 +145,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.Locale
 
 class AiBudsMainActivity : ComponentActivity() {
     private lateinit var tuneBuds: TuneBudsManager
@@ -155,6 +161,7 @@ class AiBudsMainActivity : ComponentActivity() {
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 add(Manifest.permission.NEARBY_WIFI_DEVICES)
+                add(Manifest.permission.POST_NOTIFICATIONS)
             }
             add(Manifest.permission.ACCESS_FINE_LOCATION)
             add(Manifest.permission.RECORD_AUDIO)
@@ -300,7 +307,6 @@ private fun AiBudsRootScreen(
             SettingsSheetContent(
                 gemini = gemini,
                 tuneBuds = tuneBuds,
-                glassState = glassState,
             )
         }
     }
@@ -327,6 +333,23 @@ private fun DeviceTab(
     val savedName = remember { prefs.getString("last_name", null) }
     val isConnected = state.protocolState == "CONNECTED"
     val activeName = state.deviceName ?: savedName
+
+    var recordingElapsedSec by remember { mutableLongStateOf(0L) }
+    LaunchedEffect(state.isVideoRecording, state.videoRecordingStartedAtMs) {
+        if (!state.isVideoRecording) {
+            recordingElapsedSec = 0L
+            return@LaunchedEffect
+        }
+        val startedAt = state.videoRecordingStartedAtMs ?: System.currentTimeMillis()
+        while (isActive) {
+            recordingElapsedSec = ((System.currentTimeMillis() - startedAt) / 1000L).coerceAtLeast(0L)
+            delay(500L)
+        }
+    }
+
+    val normalizedVideoLimitSec = state.videoLimitSeconds?.let { raw ->
+        if (raw in 1..15) raw * 60 else raw
+    }
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val isWide = maxWidth >= 600.dp
@@ -486,7 +509,64 @@ private fun DeviceTab(
                         contentDescription = null,
                     )
                     Spacer(Modifier.width(6.dp))
-                    Text(if (state.isVideoRecording) "Стоп" else "Видео")
+                    Text(
+                        text = if (state.isVideoRecording) {
+                            "Стоп ${formatDurationSec(recordingElapsedSec)}"
+                        } else {
+                            "Видео"
+                        },
+                        maxLines = 1,
+                    )
+                }
+            }
+
+            if (state.isVideoRecording) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFE53935).copy(alpha = 0.16f)),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = "Идёт запись видео",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = Color(0xFFFF6B6B),
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            val limitText = normalizedVideoLimitSec?.let {
+                                " / ${formatDurationSec(it.toLong())}"
+                            }.orEmpty()
+                            Text(
+                                text = "${formatDurationSec(recordingElapsedSec)}$limitText",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White,
+                            )
+                        }
+                        if (normalizedVideoLimitSec != null && normalizedVideoLimitSec > 0) {
+                            LinearProgressIndicator(
+                                progress = {
+                                    (recordingElapsedSec.toFloat() / normalizedVideoLimitSec.toFloat())
+                                        .coerceIn(0f, 1f)
+                                },
+                                color = Color(0xFFE53935),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(5.dp)
+                                    .clip(RoundedCornerShape(3.dp)),
+                            )
+                        }
+                    }
                 }
             }
 
@@ -555,7 +635,7 @@ private fun DeviceTab(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         options.forEach { (sec, label) ->
-                            val isSelected = state.videoLimitSeconds == sec || state.videoLimitSeconds == (sec / 60)
+                            val isSelected = normalizedVideoLimitSec == sec
                             FilterChip(
                                 selected = isSelected,
                                 onClick = { tuneBuds.setVideoLimit(sec) },
@@ -948,8 +1028,6 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
             sheetState = sheetState,
         ) {
             val isVideo = file.extension.equals("mp4", ignoreCase = true)
-            var videoColorPreviewMode by remember(file.absolutePath) { mutableStateOf(false) }
-            var showOriginalPreview by remember(file.absolutePath) { mutableStateOf(false) }
 
             Column(
                 modifier = Modifier
@@ -986,56 +1064,19 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
                 }
 
                 if (isVideo) {
-                    if (videoColorPreviewMode) {
-                        ExactGradeFramePreview(
-                            file = file,
-                            isVideo = true,
-                            processor = processor,
-                            preset = if (showOriginalPreview) ColorPreset.ORIGINAL else options.colorPreset,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(min = 200.dp, max = 300.dp),
-                        )
-                    } else {
-                        InlineVideoPlayer(
-                            file = file,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(min = 200.dp, max = 300.dp),
-                        )
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        TextButton(onClick = { videoColorPreviewMode = !videoColorPreviewMode }) {
-                            Text(if (videoColorPreviewMode) "Вернуть плеер" else "Превью цвета на кадре")
-                        }
-                        if (videoColorPreviewMode && options.colorPreset != ColorPreset.ORIGINAL) {
-                            TextButton(onClick = { showOriginalPreview = !showOriginalPreview }) {
-                                Text(if (showOriginalPreview) "С обработкой" else "Оригинал")
-                            }
-                        }
-                    }
-                } else {
-                    ExactGradeFramePreview(
+                    InlineVideoPlayer(
                         file = file,
-                        isVideo = false,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                } else {
+                    PhotoPreview(
+                        file = file,
                         processor = processor,
-                        preset = if (showOriginalPreview) ColorPreset.ORIGINAL else options.colorPreset,
+                        preset = options.colorPreset,
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(min = 200.dp, max = 300.dp),
                     )
-                    if (options.colorPreset != ColorPreset.ORIGINAL) {
-                        TextButton(
-                            onClick = { showOriginalPreview = !showOriginalPreview },
-                            modifier = Modifier.align(Alignment.End),
-                        ) {
-                            Text(if (showOriginalPreview) "Показать с обработкой" else "Сравнить с оригиналом")
-                        }
-                    }
                 }
 
                 Text("Обработка цвета и шумов", style = MaterialTheme.typography.labelLarge)
@@ -1043,10 +1084,7 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
                     ColorPreset.entries.forEach { preset ->
                         FilterChip(
                             selected = options.colorPreset == preset,
-                            onClick = {
-                                showOriginalPreview = false
-                                options = options.copy(colorPreset = preset)
-                            },
+                            onClick = { options = options.copy(colorPreset = preset) },
                             label = { Text(preset.label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                             modifier = Modifier.weight(1f),
                         )
@@ -1176,12 +1214,46 @@ private fun MediaTab(state: TuneBudsState, tuneBuds: TuneBudsManager) {
 
 @Composable
 private fun InlineVideoPlayer(file: File, modifier: Modifier = Modifier) {
-    var isPlaying by remember(file.absolutePath) { mutableStateOf(true) }
+    val context = LocalContext.current
+    val lifecycleOwner = context as? LifecycleOwner
+
+    var isPlaying by remember(file.absolutePath) { mutableStateOf(false) }
     var videoRatio by remember(file.absolutePath) { mutableFloatStateOf(16f / 9f) }
     var playerRef by remember(file.absolutePath) { mutableStateOf<MediaPlayer?>(null) }
+    var durationMs by remember(file.absolutePath) { mutableIntStateOf(0) }
+    var positionMs by remember(file.absolutePath) { mutableIntStateOf(0) }
+    var isScrubbing by remember(file.absolutePath) { mutableStateOf(false) }
+    var scrubMs by remember(file.absolutePath) { mutableFloatStateOf(0f) }
 
-    DisposableEffect(file.absolutePath) {
+    fun togglePlayback() {
+        val mp = playerRef ?: return
+        runCatching {
+            if (mp.isPlaying) {
+                mp.pause()
+                isPlaying = false
+            } else {
+                mp.start()
+                isPlaying = true
+            }
+        }
+    }
+
+    // Ставим плеер на паузу при сворачивании приложения или блокировке экрана
+    DisposableEffect(lifecycleOwner, file.absolutePath) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
+                runCatching {
+                    val mp = playerRef
+                    if (mp != null && mp.isPlaying) {
+                        mp.pause()
+                        isPlaying = false
+                    }
+                }
+            }
+        }
+        lifecycleOwner?.lifecycle?.addObserver(observer)
         onDispose {
+            lifecycleOwner?.lifecycle?.removeObserver(observer)
             runCatching {
                 playerRef?.stop()
                 playerRef?.release()
@@ -1190,112 +1262,157 @@ private fun InlineVideoPlayer(file: File, modifier: Modifier = Modifier) {
         }
     }
 
-    Box(
-        modifier = modifier
-            .clip(RoundedCornerShape(14.dp))
-            .background(Color.Black)
-            .clickable {
-                val mp = playerRef ?: return@clickable
+    // Обновляем ползунок перемотки пока идёт воспроизведение
+    LaunchedEffect(playerRef, isPlaying, isScrubbing) {
+        while (isActive && isPlaying) {
+            val mp = playerRef
+            if (mp != null && !isScrubbing) {
                 runCatching {
-                    if (mp.isPlaying) {
-                        mp.pause()
-                        isPlaying = false
-                    } else {
-                        mp.start()
-                        isPlaying = true
+                    positionMs = mp.currentPosition.coerceAtLeast(0)
+                    if (durationMs <= 0) {
+                        durationMs = mp.duration.coerceAtLeast(0)
                     }
                 }
-            },
-        contentAlignment = Alignment.Center,
+            }
+            delay(200L)
+        }
+    }
+
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        AndroidView(
-            factory = { ctx ->
-                TextureView(ctx).apply {
-                    var activeSurface: Surface? = null
-                    surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                        override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
-                            runCatching {
-                                val surface = Surface(st)
-                                activeSurface = surface
-                                val mp = MediaPlayer().apply {
-                                    setDataSource(file.absolutePath)
-                                    setSurface(surface)
-                                    isLooping = true
-                                    setOnVideoSizeChangedListener { _, vw, vh ->
-                                        if (vw > 0 && vh > 0) {
-                                            videoRatio = vw.toFloat() / vh.toFloat()
-                                        }
-                                    }
-                                    setOnPreparedListener {
-                                        start()
-                                        isPlaying = true
-                                    }
-                                    prepareAsync()
-                                }
-                                playerRef = mp
-                            }
-                        }
-
-                        override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) = Unit
-
-                        override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
-                            runCatching {
-                                playerRef?.stop()
-                                playerRef?.release()
-                            }
-                            playerRef = null
-                            runCatching { activeSurface?.release() }
-                            activeSurface = null
-                            return true
-                        }
-
-                        override fun onSurfaceTextureUpdated(st: SurfaceTexture) = Unit
-                    }
-                }
-            },
+        Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .aspectRatio(videoRatio.coerceIn(0.6f, 2.2f)),
-        )
+                .heightIn(min = 190.dp, max = 280.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .background(Color.Black)
+                .clickable { togglePlayback() },
+            contentAlignment = Alignment.Center,
+        ) {
+            AndroidView(
+                factory = { ctx ->
+                    TextureView(ctx).apply {
+                        var activeSurface: Surface? = null
+                        surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                            override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+                                runCatching {
+                                    val surface = Surface(st)
+                                    activeSurface = surface
+                                    val mp = MediaPlayer().apply {
+                                        setDataSource(file.absolutePath)
+                                        setSurface(surface)
+                                        isLooping = true
+                                        setOnVideoSizeChangedListener { _, vw, vh ->
+                                            if (vw > 0 && vh > 0) {
+                                                videoRatio = vw.toFloat() / vh.toFloat()
+                                            }
+                                        }
+                                        setOnPreparedListener { readyMp ->
+                                            durationMs = readyMp.duration.coerceAtLeast(0)
+                                            positionMs = 0
+                                            readyMp.start()
+                                            isPlaying = true
+                                        }
+                                        prepareAsync()
+                                    }
+                                    playerRef = mp
+                                }
+                            }
 
-        if (!isPlaying) {
-            Box(
+                            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) = Unit
+
+                            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                                runCatching {
+                                    playerRef?.stop()
+                                    playerRef?.release()
+                                }
+                                playerRef = null
+                                isPlaying = false
+                                runCatching { activeSurface?.release() }
+                                activeSurface = null
+                                return true
+                            }
+
+                            override fun onSurfaceTextureUpdated(st: SurfaceTexture) = Unit
+                        }
+                    }
+                },
                 modifier = Modifier
-                    .size(52.dp)
-                    .clip(CircleShape)
-                    .background(Color.Black.copy(alpha = 0.65f)),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(Icons.Default.PlayArrow, contentDescription = "Воспроизвести", tint = Color.White)
+                    .fillMaxWidth()
+                    .aspectRatio(videoRatio.coerceIn(0.6f, 2.2f)),
+            )
+
+            if (!isPlaying) {
+                Box(
+                    modifier = Modifier
+                        .size(52.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.65f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(Icons.Default.PlayArrow, contentDescription = "Воспроизвести", tint = Color.White)
+                }
             }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            IconButton(
+                onClick = { togglePlayback() },
+                modifier = Modifier.size(34.dp),
+            ) {
+                Icon(
+                    imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                    contentDescription = if (isPlaying) "Пауза" else "Плей",
+                )
+            }
+
+            val maxMs = durationMs.coerceAtLeast(1).toFloat()
+            val shownMs = if (isScrubbing) scrubMs else positionMs.toFloat().coerceIn(0f, maxMs)
+
+            Slider(
+                value = shownMs,
+                onValueChange = { newVal ->
+                    isScrubbing = true
+                    scrubMs = newVal
+                },
+                onValueChangeFinished = {
+                    val target = scrubMs.toInt().coerceIn(0, durationMs.coerceAtLeast(0))
+                    runCatching { playerRef?.seekTo(target) }
+                    positionMs = target
+                    isScrubbing = false
+                },
+                valueRange = 0f..maxMs,
+                enabled = durationMs > 0,
+                modifier = Modifier.weight(1f),
+            )
+
+            Text(
+                text = "${formatDurationSec((shownMs / 1000f).toLong())} / ${formatDurationSec((durationMs / 1000).toLong())}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
 
 @Composable
-private fun ExactGradeFramePreview(
+private fun PhotoPreview(
     file: File,
-    isVideo: Boolean,
     processor: MetaVideoProcessor,
     preset: ColorPreset,
     modifier: Modifier = Modifier,
 ) {
-    val baseBmp by produceState<Bitmap?>(initialValue = null, key1 = file.absolutePath, key2 = isVideo) {
+    val baseBmp by produceState<Bitmap?>(initialValue = null, key1 = file.absolutePath) {
         value = withContext(Dispatchers.IO) {
             runCatching {
-                if (isVideo) {
-                    val mmr = MediaMetadataRetriever()
-                    try {
-                        mmr.setDataSource(file.absolutePath)
-                        mmr.getFrameAtTime(1_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                            ?: mmr.getFrameAtTime(0L)
-                    } finally {
-                        runCatching { mmr.release() }
-                    }
-                } else {
-                    val opts = BitmapFactory.Options().apply { inSampleSize = 2 }
-                    BitmapFactory.decodeFile(file.absolutePath, opts)
-                }
+                val opts = BitmapFactory.Options().apply { inSampleSize = 2 }
+                BitmapFactory.decodeFile(file.absolutePath, opts)
             }.getOrNull()
         }
     }
@@ -1327,20 +1444,6 @@ private fun ExactGradeFramePreview(
                 contentScale = ContentScale.Fit,
                 modifier = Modifier.fillMaxSize(),
             )
-            Box(
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(8.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(Color.Black.copy(alpha = 0.65f))
-                    .padding(horizontal = 8.dp, vertical = 4.dp),
-            ) {
-                Text(
-                    text = if (preset == ColorPreset.ORIGINAL) "ОРИГИНАЛ" else "ОБРАБОТКА: ${preset.label}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = if (preset == ColorPreset.ORIGINAL) Color.White else Color(0xFF34D399),
-                )
-            }
         } else {
             CircularProgressIndicator(modifier = Modifier.size(28.dp))
         }
@@ -1438,7 +1541,6 @@ private fun MediaGridTile(
 private fun SettingsSheetContent(
     gemini: GeminiGlassAssistant,
     tuneBuds: TuneBudsManager,
-    glassState: TuneBudsState,
 ) {
     val context = LocalContext.current
     val cfg by gemini.config.collectAsState()
@@ -1460,62 +1562,7 @@ private fun SettingsSheetContent(
             .padding(horizontal = 20.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        Text("Настройки", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-
-        Text("Управление тачпадом", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            OutlinedButton(
-                onClick = { tuneBuds.applyTouchpadPreset(0) },
-                enabled = glassState.protocolState == "CONNECTED",
-                modifier = Modifier.weight(1f),
-                shape = RoundedCornerShape(12.dp),
-            ) {
-                Text("Удобный", maxLines = 1)
-            }
-            OutlinedButton(
-                onClick = { tuneBuds.applyTouchpadPreset(1) },
-                enabled = glassState.protocolState == "CONNECTED",
-                modifier = Modifier.weight(1f),
-                shape = RoundedCornerShape(12.dp),
-            ) {
-                Text("Заводской", maxLines = 1)
-            }
-        }
-        Text(
-            text = "Удобный: 1× Пауза, 2× След. трек, 3× Пред. трек\nЗаводской: 1× Выкл, 2× Пауза, 3× След. трек",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        if (glassState.keySettings.isNotEmpty()) {
-            val single = glassState.keySettings[TuneBudsProtocol.KEY_RIGHT_SINGLE]
-                ?: glassState.keySettings[TuneBudsProtocol.KEY_LEFT_SINGLE]
-            val dbl = glassState.keySettings[TuneBudsProtocol.KEY_RIGHT_DOUBLE]
-                ?: glassState.keySettings[TuneBudsProtocol.KEY_LEFT_DOUBLE]
-            val triple = glassState.keySettings[TuneBudsProtocol.KEY_RIGHT_TRIPLE]
-                ?: glassState.keySettings[TuneBudsProtocol.KEY_LEFT_TRIPLE]
-            Text(
-                text = "Сейчас на очках: " +
-                    "1× ${single?.let(TuneBudsProtocol::keyFunctionLabel) ?: "—"}, " +
-                    "2× ${dbl?.let(TuneBudsProtocol::keyFunctionLabel) ?: "—"}, " +
-                    "3× ${triple?.let(TuneBudsProtocol::keyFunctionLabel) ?: "—"}",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.secondary,
-            )
-        }
-        glassState.gestureStatus?.let { st ->
-            Text(
-                text = st,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.secondary,
-            )
-        }
-
-        HorizontalDivider()
-
-        Text("Ассистент Gemini", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+        Text("Настройки ИИ", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
 
         OutlinedTextField(
             value = apiKey,
@@ -1629,4 +1676,11 @@ private fun SettingsSheetContent(
 
         Spacer(Modifier.height(20.dp))
     }
+}
+
+private fun formatDurationSec(totalSec: Long): String {
+    val safe = totalSec.coerceAtLeast(0L)
+    val mins = safe / 60L
+    val secs = safe % 60L
+    return String.format(Locale.US, "%02d:%02d", mins, secs)
 }
