@@ -69,8 +69,6 @@ data class TuneBudsState(
     val isVideoRecording: Boolean = false,
     val videoRecordingStartedAtMs: Long? = null,
     val isAudioRecording: Boolean = false,
-    val keySettings: Map<Int, Int> = emptyMap(),
-    val rawKeySettingsHex: String? = null,
     val lastError: String? = null,
 )
 
@@ -195,13 +193,11 @@ class TuneBudsManager private constructor(context: Context) {
         stopCameraSubsystem()
     }
 
-    /** Совместимая обёртка для MainActivity и GeminiLiveGlassesImageCapture. */
-    suspend fun capturePhotoForAi(timeoutMs: Long = 15_000L): ByteArray? =
-        capturePhotoForAiResult(timeoutMs).getOrNull()
-
-    suspend fun capturePhotoForAiResult(timeoutMs: Long = 15_000L): Result<ByteArray> = coroutineScope {
+    /** Делает ИИ-снимок с очков. При неудаче пишет точную причину в state.value.lastError и возвращает null. */
+    suspend fun capturePhotoForAi(timeoutMs: Long = 15_000L): ByteArray? = coroutineScope {
         if (!client.isConnected()) {
-            return@coroutineScope Result.failure(IOException("Очки не подключены"))
+            updateError("Очки не подключены")
+            return@coroutineScope null
         }
         synchronized(aiPictureBuffer) { aiPictureBuffer.reset() }
         val photoDeferred = async(start = CoroutineStart.UNDISPATCHED) { aiPhotos.first() }
@@ -214,18 +210,20 @@ class TuneBudsManager private constructor(context: Context) {
                 } else {
                     ""
                 }
-                return@coroutineScope Result.failure(
-                    IOException("Очки не смогли сделать фото: код ${status ?: "?"}$hint"),
-                )
+                updateError("Очки не смогли сделать фото: код ${status ?: "?"}$hint")
+                return@coroutineScope null
             }
             val bytes = withTimeoutOrNull(timeoutMs) { photoDeferred.await() }
             if (bytes != null && bytes.isNotEmpty()) {
-                Result.success(bytes)
+                _state.value = _state.value.copy(lastError = null)
+                bytes
             } else {
-                Result.failure(IOException("Таймаут получения фото с очков"))
+                updateError("Таймаут получения фото с очков")
+                null
             }
         } catch (err: Throwable) {
-            Result.failure(err)
+            updateError("Ошибка фото с очков: ${err.message ?: "нет ответа"}")
+            null
         } finally {
             photoDeferred.cancel()
         }
@@ -269,15 +267,7 @@ class TuneBudsManager private constructor(context: Context) {
         _state.value = _state.value.copy(inEarDetectionEnabled = enabled, lastError = null)
     }
 
-    /** Безопасно считывает сырую таблицу кнопок 0x05 без записи в память очков. */
-    fun requestKeySettings() = launchCommand("прочитать слоты кнопок") {
-        requestDeviceInfo(TuneBudsProtocol.INFO_KEY_SETTINGS)
-    }
-
-    /**
-     * Отправляет AIChatStateRequest (0xB0): 1 = SCO, 2 = OPUS, 0 = закрыть.
-     * Не блокирует очередь надолго, если прошивка не шлёт RESPONSE на 0xB0.
-     */
+    /** Отправляет AIChatStateRequest (0xB0): 1 = SCO, 2 = OPUS, 0 = закрыть. */
     fun setAiChatState(mode: Int) {
         scope.launch {
             if (!client.isConnected()) return@launch
@@ -355,7 +345,6 @@ class TuneBudsManager private constructor(context: Context) {
         requestDeviceInfo(
             TuneBudsProtocol.INFO_BATTERY,
             TuneBudsProtocol.INFO_FIRMWARE_VERSION,
-            TuneBudsProtocol.INFO_KEY_SETTINGS,
             TuneBudsProtocol.INFO_MODEL,
             TuneBudsProtocol.INFO_SERIAL_NUMBER,
             TuneBudsProtocol.INFO_IN_EAR_STATE,
@@ -449,7 +438,6 @@ class TuneBudsManager private constructor(context: Context) {
         requestDeviceInfo(
             TuneBudsProtocol.INFO_BATTERY,
             TuneBudsProtocol.INFO_FIRMWARE_VERSION,
-            TuneBudsProtocol.INFO_KEY_SETTINGS,
             TuneBudsProtocol.INFO_MODEL,
             TuneBudsProtocol.INFO_SERIAL_NUMBER,
             TuneBudsProtocol.INFO_IN_EAR_STATE,
@@ -462,7 +450,6 @@ class TuneBudsManager private constructor(context: Context) {
 
         runCatching {
             request(TuneBudsProtocol.CMD_GLASS_CONFIG, TuneBudsProtocol.buildAiServiceAuthPayload())
-            Log.i(TAG, "AI service auth state sent to glasses (0xF7 -> 0x8B [1, 1])")
         }.onFailure {
             Log.w(TAG, "Optional setAiServiceAuthed failed: ${it.message}")
         }
@@ -605,21 +592,11 @@ class TuneBudsManager private constructor(context: Context) {
                     .onFailure { Log.w(TAG, "Invalid device-info response", it) }
             }
             TuneBudsProtocol.INFO_BATTERY -> TuneBudsProtocol.parseBattery(frame.payload)?.let(::applyBattery)
-            TuneBudsProtocol.INFO_KEY_SETTINGS -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
-                val keys = TuneBudsProtocol.parseKeySettings(frame.payload)
-                val updated = _state.value.keySettings.toMutableMap().apply { putAll(keys) }
-                _state.value = _state.value.copy(
-                    keySettings = updated,
-                    rawKeySettingsHex = formatHex(frame.payload),
-                    lastError = null,
-                )
-            }
             TuneBudsProtocol.INFO_IN_EAR_STATE -> TuneBudsProtocol.parseSupportFlag(frame.payload)?.let { enabled ->
                 _state.value = _state.value.copy(inEarDetectionEnabled = enabled, lastError = null)
             }
             TuneBudsProtocol.CMD_AI_CHAT_STATE -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
                 val aiState = TuneBudsProtocol.parseStatus(frame.payload) ?: return
-                Log.i(TAG, "Glasses AI Chat state notification: $aiState")
                 _state.value = _state.value.copy(lastAiChatState = aiState)
                 _aiEvents.tryEmit(TuneBudsAiEvent(chatState = aiState))
             }
@@ -670,14 +647,6 @@ class TuneBudsManager private constructor(context: Context) {
         }
         info[TuneBudsProtocol.INFO_FIRMWARE_VERSION]?.let { payload ->
             TuneBudsProtocol.parseFirmwareVersion(payload)?.let { current = current.copy(firmwareVersion = it) }
-        }
-        info[TuneBudsProtocol.INFO_KEY_SETTINGS]?.let { payload ->
-            val keys = TuneBudsProtocol.parseKeySettings(payload)
-            val merged = current.keySettings.toMutableMap().apply { putAll(keys) }
-            current = current.copy(
-                keySettings = merged,
-                rawKeySettingsHex = formatHex(payload),
-            )
         }
         info[TuneBudsProtocol.INFO_MODEL]?.let { payload ->
             TuneBudsProtocol.parseString(payload)?.let { current = current.copy(model = it) }
@@ -782,9 +751,6 @@ class TuneBudsManager private constructor(context: Context) {
             }
         }
     }
-
-    private fun formatHex(bytes: ByteArray): String =
-        bytes.joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
 
     private fun launchCommand(operation: String, block: suspend () -> Unit) {
         scope.launch {
