@@ -67,6 +67,7 @@ data class TuneBudsState(
     val wifiState: Int? = null,
     val workState: Int? = null,
     val isVideoRecording: Boolean = false,
+    val videoRecordingStartedAtMs: Long? = null,
     val isAudioRecording: Boolean = false,
     val lastError: String? = null,
 )
@@ -96,7 +97,7 @@ class TuneBudsManager private constructor(context: Context) {
     private val requestMutex = Mutex()
     private val aiPictureBuffer = ByteArrayOutputStream()
     private val _state = MutableStateFlow(TuneBudsState())
-    private val _aiPhotos = MutableSharedFlow<ByteArray>(extraBufferCapacity = 2)
+    private val _aiPhotos = MutableSharedFlow<ByteArray>(extraBufferCapacity = 1)
     private val _aiEvents = MutableSharedFlow<TuneBudsAiEvent>(extraBufferCapacity = 16)
     private val _aiOpusPackets = MutableSharedFlow<ByteArray>(extraBufferCapacity = 256)
     private var connectJob: Job? = null
@@ -116,22 +117,23 @@ class TuneBudsManager private constructor(context: Context) {
                     TuneBudsSppState.CONNECTED -> "Подключено"
                     TuneBudsSppState.ERROR -> _state.value.lastError ?: "Ошибка подключения"
                 }
-                if (transportState == TuneBudsSppState.DISCONNECTED || transportState == TuneBudsSppState.ERROR) {
-                    AiBudsGlassService.stop(appContext)
+                val connected = transportState == TuneBudsSppState.CONNECTED
+                if (connected) {
+                    AiBudsForegroundService.start(
+                        appContext,
+                        _state.value.deviceName ?: _state.value.model,
+                    )
+                } else if (transportState == TuneBudsSppState.DISCONNECTED ||
+                    transportState == TuneBudsSppState.ERROR
+                ) {
+                    AiBudsForegroundService.stop(appContext)
                 }
                 _state.value = _state.value.copy(
                     connectionLabel = label,
                     protocolState = transportState.name,
-                    isVideoRecording = if (transportState == TuneBudsSppState.CONNECTED) {
-                        _state.value.isVideoRecording
-                    } else {
-                        false
-                    },
-                    isAudioRecording = if (transportState == TuneBudsSppState.CONNECTED) {
-                        _state.value.isAudioRecording
-                    } else {
-                        false
-                    },
+                    isVideoRecording = if (connected) _state.value.isVideoRecording else false,
+                    videoRecordingStartedAtMs = if (connected) _state.value.videoRecordingStartedAtMs else null,
+                    isAudioRecording = if (connected) _state.value.isAudioRecording else false,
                 )
             }
         }
@@ -150,8 +152,6 @@ class TuneBudsManager private constructor(context: Context) {
             return
         }
         connectJob?.cancel()
-        // Поднимаем Foreground Service сразу пока приложение на экране (требование Android 14+ для микрофона в фоне)
-        AiBudsGlassService.start(appContext, deviceName)
         _state.value = TuneBudsState(
             connectionLabel = "Подключение...",
             protocolState = TuneBudsSppState.CONNECTING.name,
@@ -160,10 +160,10 @@ class TuneBudsManager private constructor(context: Context) {
         )
         connectJob = scope.launch {
             client.connect(normalizedAddress).getOrElse { error ->
-                AiBudsGlassService.stop(appContext)
                 updateError(error.message ?: "Не удалось подключиться к очкам")
                 return@launch
             }
+            AiBudsForegroundService.start(appContext, deviceName)
             _state.value = _state.value.copy(
                 connectionLabel = "Подключено",
                 protocolState = TuneBudsSppState.CONNECTED.name,
@@ -177,7 +177,7 @@ class TuneBudsManager private constructor(context: Context) {
     fun disconnect() {
         connectJob?.cancel()
         connectJob = null
-        AiBudsGlassService.stop(appContext)
+        AiBudsForegroundService.stop(appContext)
         client.disconnect()
     }
 
@@ -193,15 +193,35 @@ class TuneBudsManager private constructor(context: Context) {
         stopCameraSubsystem()
     }
 
-    suspend fun capturePhotoForAi(timeoutMs: Long = 15_000L): ByteArray? = coroutineScope {
-        if (!client.isConnected()) return@coroutineScope null
+    suspend fun capturePhotoForAi(timeoutMs: Long = 15_000L): Result<ByteArray> = coroutineScope {
+        if (!client.isConnected()) {
+            return@coroutineScope Result.failure(IOException("Очки не подключены"))
+        }
         synchronized(aiPictureBuffer) { aiPictureBuffer.reset() }
-        val photo = async(start = CoroutineStart.UNDISPATCHED) { aiPhotos.first() }
+        val photoDeferred = async(start = CoroutineStart.UNDISPATCHED) { aiPhotos.first() }
         try {
-            requireSuccess(request(TuneBudsProtocol.CMD_CAMERA_ON, byteArrayOf(1)))
-            withTimeoutOrNull(timeoutMs) { photo.await() }
+            val resp = request(TuneBudsProtocol.CMD_CAMERA_ON, byteArrayOf(1))
+            val status = TuneBudsProtocol.parseStatus(resp.payload)
+            if (status != 0) {
+                val hint = if ((_state.value.batteryPercent ?: 100) < 30) {
+                    " (возможно, низкий заряд очков)"
+                } else {
+                    ""
+                }
+                return@coroutineScope Result.failure(
+                    IOException("Очки не смогли сделать фото: код ${status ?: "?"}$hint"),
+                )
+            }
+            val bytes = withTimeoutOrNull(timeoutMs) { photoDeferred.await() }
+            if (bytes != null && bytes.isNotEmpty()) {
+                Result.success(bytes)
+            } else {
+                Result.failure(IOException("Таймаут получения фото с очков"))
+            }
+        } catch (err: Throwable) {
+            Result.failure(err)
         } finally {
-            photo.cancel()
+            photoDeferred.cancel()
         }
     }
 
@@ -210,7 +230,11 @@ class TuneBudsManager private constructor(context: Context) {
             stopCameraSubsystem()
         } else {
             requireSuccess(request(TuneBudsProtocol.CMD_START_VIDEO))
-            _state.value = _state.value.copy(isVideoRecording = true, isAudioRecording = false)
+            _state.value = _state.value.copy(
+                isVideoRecording = true,
+                videoRecordingStartedAtMs = System.currentTimeMillis(),
+                isAudioRecording = false,
+            )
         }
     }
 
@@ -239,6 +263,10 @@ class TuneBudsManager private constructor(context: Context) {
         _state.value = _state.value.copy(inEarDetectionEnabled = enabled, lastError = null)
     }
 
+    /**
+     * Отправляет AIChatStateRequest (0xB0): 1 = SCO, 2 = OPUS, 0 = закрыть.
+     * Не блокирует очередь надолго, если прошивка не шлёт RESPONSE на 0xB0.
+     */
     fun setAiChatState(mode: Int) {
         scope.launch {
             if (!client.isConnected()) return@launch
@@ -256,7 +284,11 @@ class TuneBudsManager private constructor(context: Context) {
             stopCameraSubsystem()
         } else {
             requireSuccess(request(TuneBudsProtocol.CMD_START_AUDIO))
-            _state.value = _state.value.copy(isAudioRecording = true, isVideoRecording = false)
+            _state.value = _state.value.copy(
+                isAudioRecording = true,
+                isVideoRecording = false,
+                videoRecordingStartedAtMs = null,
+            )
         }
     }
 
@@ -296,8 +328,8 @@ class TuneBudsManager private constructor(context: Context) {
 
     fun requestWorkState() = launchCommand("прочитать состояние") {
         val response = request(TuneBudsProtocol.CMD_WORK_STATE)
-        TuneBudsProtocol.parseStatus(response.payload)?.let { state ->
-            _state.value = _state.value.copy(workState = state, lastError = null)
+        TuneBudsProtocol.parseStatus(response.payload)?.let { value ->
+            applyWorkState(value)
         }
     }
 
@@ -417,6 +449,7 @@ class TuneBudsManager private constructor(context: Context) {
         )
         runCatching { requestCapabilityInfo() }
 
+        // Сообщаем прошивке очков, что ИИ-сервис авторизован (аналог setAiServiceAuthed в ABMateManager)
         runCatching {
             request(TuneBudsProtocol.CMD_GLASS_CONFIG, TuneBudsProtocol.buildAiServiceAuthPayload())
             Log.i(TAG, "AI service auth state sent to glasses (0xF7 -> 0x8B [1, 1])")
@@ -428,9 +461,7 @@ class TuneBudsManager private constructor(context: Context) {
         requireSuccess(request(TuneBudsProtocol.CMD_STORAGE))
         requireSuccess(request(TuneBudsProtocol.CMD_MEDIA_COUNTS))
         val workState = request(TuneBudsProtocol.CMD_WORK_STATE)
-        TuneBudsProtocol.parseStatus(workState.payload)?.let { value ->
-            _state.value = _state.value.copy(workState = value)
-        }
+        TuneBudsProtocol.parseStatus(workState.payload)?.let(::applyWorkState)
     }
 
     private suspend fun requestCapabilityInfo() {
@@ -512,7 +543,11 @@ class TuneBudsManager private constructor(context: Context) {
             val response = request(TuneBudsProtocol.CMD_CAMERA_CLOSE)
             when (val status = TuneBudsProtocol.parseStatus(response.payload)) {
                 0 -> {
-                    _state.value = _state.value.copy(isVideoRecording = false, isAudioRecording = false)
+                    _state.value = _state.value.copy(
+                        isVideoRecording = false,
+                        videoRecordingStartedAtMs = null,
+                        isAudioRecording = false,
+                    )
                     return
                 }
                 1 -> {
@@ -535,6 +570,18 @@ class TuneBudsManager private constructor(context: Context) {
         }
     }
 
+    private fun applyWorkState(value: Int) {
+        val cur = _state.value
+        val stoppedByGlasses = value == 0 && (cur.isVideoRecording || cur.isAudioRecording)
+        _state.value = cur.copy(
+            workState = value,
+            isVideoRecording = if (stoppedByGlasses) false else cur.isVideoRecording,
+            videoRecordingStartedAtMs = if (stoppedByGlasses) null else cur.videoRecordingStartedAtMs,
+            isAudioRecording = if (stoppedByGlasses) false else cur.isAudioRecording,
+            lastError = null,
+        )
+    }
+
     private fun handleFrame(frame: TuneBudsFrame) {
         when (frame.command) {
             TuneBudsProtocol.CMD_WIFI_STATE -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
@@ -551,12 +598,14 @@ class TuneBudsManager private constructor(context: Context) {
             TuneBudsProtocol.INFO_IN_EAR_STATE -> TuneBudsProtocol.parseSupportFlag(frame.payload)?.let { enabled ->
                 _state.value = _state.value.copy(inEarDetectionEnabled = enabled, lastError = null)
             }
+            // Событие удержания дужки / AI-чата (0xB0 NOTIFICATION: 1=SCO, 2=OPUS, 0=CLOSE, 255=ERR)
             TuneBudsProtocol.CMD_AI_CHAT_STATE -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
                 val aiState = TuneBudsProtocol.parseStatus(frame.payload) ?: return
                 Log.i(TAG, "Glasses AI Chat state notification: $aiState")
                 _state.value = _state.value.copy(lastAiChatState = aiState)
                 _aiEvents.tryEmit(TuneBudsAiEvent(chatState = aiState))
             }
+            // Поток OPUS с микрофона очков по SPP (0xB2 NOTIFICATION, кадры по 80 байт / 20 мс)
             TuneBudsProtocol.CMD_AI_RECORD_DATA -> if (frame.type == TuneBudsFrameType.NOTIFICATION && frame.payload.isNotEmpty()) {
                 _aiOpusPackets.tryEmit(frame.payload.copyOf())
             }
@@ -588,9 +637,7 @@ class TuneBudsManager private constructor(context: Context) {
                     _state.value = _state.value.copy(mediaCounts = counts, lastError = null)
                 }
             }
-            TuneBudsProtocol.CMD_WORK_STATE -> TuneBudsProtocol.parseStatus(frame.payload)?.let { value ->
-                _state.value = _state.value.copy(workState = value, lastError = null)
-            }
+            TuneBudsProtocol.CMD_WORK_STATE -> TuneBudsProtocol.parseStatus(frame.payload)?.let(::applyWorkState)
         }
     }
 
@@ -718,7 +765,7 @@ class TuneBudsManager private constructor(context: Context) {
                 return@launch
             }
             runCatching { block() }
-                .onFailure { error -> updateError("Не удалось $operation: ${error.message}") }
+                .onFailure { error -> updateError("Не удалось $operation:${error.message}") }
         }
     }
 
