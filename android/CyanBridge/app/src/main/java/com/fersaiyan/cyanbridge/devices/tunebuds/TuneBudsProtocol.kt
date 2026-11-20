@@ -49,12 +49,11 @@ data class TuneBudsScreenConfig(
     val isLandscape: Boolean,
 )
 
-/** Точный кодек AB Mate по спецификации из aibuds.apk. */
+/** Кодек протокола Bluetrum AB Mate. */
 object TuneBudsProtocol {
     const val DEFAULT_MAX_PACKET_SIZE = 20
     const val HEADER_SIZE = 5
 
-    const val CMD_KEY = 0x22
     const val CMD_SET_DETECTION = 0x26
     const val CMD_DEVICE_INFO = 0x27
     const val CMD_AI_CHAT_STATE = 0xB0
@@ -81,43 +80,20 @@ object TuneBudsProtocol {
     const val CMD_TELEPROMPTER = 0xF8
     const val CMD_TELEPROMPTER_CONTROL = 0xFB
 
-    // Состояния 0xB0 (SpeechAiProtocolKt)
+    // Состояния 0xB0
     const val AI_CHAT_CLOSE = 0
     const val AI_CHAT_OPEN_SCO = 1
     const val AI_CHAT_OPEN_OPUS = 2
     const val AI_CHAT_ERROR = 255
 
-    // Субкоманды CMD_GLASS_CONFIG (0xF7 / GlassConfigRequest)
+    // Субкоманды CMD_GLASS_CONFIG (0xF7)
     const val CONFIG_VIDEO_LIMIT_TIME = 0x82
     const val CONFIG_AUDIO_LIMIT_TIME = 0x83
-    const val CONFIG_SERVICE_AUTH_STATE = 0x8B // -117: setAiServiceAuthed
+    const val CONFIG_SERVICE_AUTH_STATE = 0x8B
 
-    // Типы жестов (KeyRequest)
-    const val KEY_LEFT_SINGLE = 1
-    const val KEY_RIGHT_SINGLE = 2
-    const val KEY_LEFT_DOUBLE = 3
-    const val KEY_RIGHT_DOUBLE = 4
-    const val KEY_LEFT_TRIPLE = 5
-    const val KEY_RIGHT_TRIPLE = 6
-    const val KEY_LEFT_LONG = 7
-    const val KEY_RIGHT_LONG = 8
-
-    // Функции жестов (KeyRequest)
-    const val KEY_FUNC_NONE = 0
-    const val KEY_FUNC_RECALL = 1
-    const val KEY_FUNC_ASSISTANT = 2
-    const val KEY_FUNC_PREV = 3
-    const val KEY_FUNC_NEXT = 4
-    const val KEY_FUNC_VOL_UP = 5
-    const val KEY_FUNC_VOL_DOWN = 6
-    const val KEY_FUNC_PLAY_PAUSE = 7
-    const val KEY_FUNC_GAME_MODE = 8
-    const val KEY_FUNC_ANC_MODE = 9
-
-    // Device Info IDs (Command.java)
+    // Device Info IDs
     const val INFO_BATTERY = 0x01
     const val INFO_FIRMWARE_VERSION = 0x02
-    const val INFO_KEY_SETTINGS = 0x05
     const val INFO_IN_EAR_STATE = 0x09
     const val INFO_MAX_PACKET_SIZE = 0xFF
     const val INFO_AI_KIT_SUPPORT = 0xA0
@@ -198,24 +174,7 @@ object TuneBudsProtocol {
         return values
     }
 
-    /** Точный аналог KeyPayloadHandler.java: [keyType, 0x01, keyFunction]. */
-    fun parseKeySettings(payload: ByteArray): Map<Int, Int> {
-        val result = linkedMapOf<Int, Int>()
-        var cursor = 0
-        while (cursor + 2 <= payload.size) {
-            val keyType = payload[cursor].toInt() and 0xFF
-            val len = payload[cursor + 1].toInt() and 0xFF
-            cursor += 2
-            if (cursor + len > payload.size) break
-            if (len == 1) {
-                result[keyType] = payload[cursor].toInt() and 0xFF
-            }
-            cursor += len
-        }
-        return result
-    }
-
-    /** Точный аналог TlvResponsePayloadHandler.java: [subCmd, 0x01, status] -> true если status == 0. */
+    /** Разбирает TLV-ответ [subCmd, 0x01, status] -> true если status == 0. */
     fun parseTlvResponse(payload: ByteArray): Map<Int, Boolean> {
         val result = linkedMapOf<Int, Boolean>()
         var cursor = 0
@@ -230,20 +189,6 @@ object TuneBudsProtocol {
             cursor += len
         }
         return result
-    }
-
-    fun keyFunctionLabel(func: Int): String = when (func) {
-        KEY_FUNC_NONE -> "Выкл"
-        KEY_FUNC_RECALL -> "Повтор вызова"
-        KEY_FUNC_ASSISTANT -> "Ассистент"
-        KEY_FUNC_PREV -> "Пред. трек"
-        KEY_FUNC_NEXT -> "След. трек"
-        KEY_FUNC_VOL_UP -> "Громкость +"
-        KEY_FUNC_VOL_DOWN -> "Громкость −"
-        KEY_FUNC_PLAY_PAUSE -> "Пауза / Плей"
-        KEY_FUNC_GAME_MODE -> "Игровой режим"
-        KEY_FUNC_ANC_MODE -> "Шумодав"
-        else -> "Код $func"
     }
 
     fun parseBattery(payload: ByteArray): TuneBudsBattery? {
@@ -371,9 +316,6 @@ object TuneBudsProtocol {
         )
     }
 
-    fun buildKeyPayload(keyType: Int, keyFunction: Int): ByteArray =
-        byteArrayOf(keyType.toByte(), 0x01, keyFunction.toByte())
-
     fun rtspQualityPayload(quality: Int): ByteArray = when (quality) {
         in 0..24 -> byteArrayOf(0x01, 0x1E, 0x3C)
         in 25..49 -> byteArrayOf(0x02, 0x14, 0x1E)
@@ -391,8 +333,8 @@ object TuneBudsProtocol {
 }
 
 /**
- * Потоковый парсер RFCOMM-данных, полностью повторяющий PacketParser.java из aibuds.apk:
- * - Конверт 55 AA <seq> <lenHi> <lenLo> <payload> A5 5A разбирается строго по полю длины.
+ * Потоковый парсер RFCOMM-данных:
+ * - Конверт 55 AA <seq> <lenHi> <lenLo> <payload> A5 5A разбирается по полю длины.
  * - AB Mate пакеты проверяются по маске (b0 & 0x70) == 0 и типу (1..3).
  */
 class TuneBudsFrameDecoder {
