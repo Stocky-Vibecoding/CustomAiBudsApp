@@ -69,6 +69,8 @@ data class TuneBudsState(
     val isVideoRecording: Boolean = false,
     val videoRecordingStartedAtMs: Long? = null,
     val isAudioRecording: Boolean = false,
+    val keySettings: Map<Int, Int> = emptyMap(),
+    val rawKeySettingsHex: String? = null,
     val lastError: String? = null,
 )
 
@@ -263,6 +265,11 @@ class TuneBudsManager private constructor(context: Context) {
         _state.value = _state.value.copy(inEarDetectionEnabled = enabled, lastError = null)
     }
 
+    /** Безопасно считывает сырую таблицу кнопок 0x05 без записи в память очков. */
+    fun requestKeySettings() = launchCommand("прочитать слоты кнопок") {
+        requestDeviceInfo(TuneBudsProtocol.INFO_KEY_SETTINGS)
+    }
+
     /**
      * Отправляет AIChatStateRequest (0xB0): 1 = SCO, 2 = OPUS, 0 = закрыть.
      * Не блокирует очередь надолго, если прошивка не шлёт RESPONSE на 0xB0.
@@ -328,9 +335,7 @@ class TuneBudsManager private constructor(context: Context) {
 
     fun requestWorkState() = launchCommand("прочитать состояние") {
         val response = request(TuneBudsProtocol.CMD_WORK_STATE)
-        TuneBudsProtocol.parseStatus(response.payload)?.let { value ->
-            applyWorkState(value)
-        }
+        TuneBudsProtocol.parseStatus(response.payload)?.let(::applyWorkState)
     }
 
     fun syncTime() = launchCommand("синхронизировать время") {
@@ -346,6 +351,7 @@ class TuneBudsManager private constructor(context: Context) {
         requestDeviceInfo(
             TuneBudsProtocol.INFO_BATTERY,
             TuneBudsProtocol.INFO_FIRMWARE_VERSION,
+            TuneBudsProtocol.INFO_KEY_SETTINGS,
             TuneBudsProtocol.INFO_MODEL,
             TuneBudsProtocol.INFO_SERIAL_NUMBER,
             TuneBudsProtocol.INFO_IN_EAR_STATE,
@@ -439,6 +445,7 @@ class TuneBudsManager private constructor(context: Context) {
         requestDeviceInfo(
             TuneBudsProtocol.INFO_BATTERY,
             TuneBudsProtocol.INFO_FIRMWARE_VERSION,
+            TuneBudsProtocol.INFO_KEY_SETTINGS,
             TuneBudsProtocol.INFO_MODEL,
             TuneBudsProtocol.INFO_SERIAL_NUMBER,
             TuneBudsProtocol.INFO_IN_EAR_STATE,
@@ -595,6 +602,15 @@ class TuneBudsManager private constructor(context: Context) {
                     .onFailure { Log.w(TAG, "Invalid device-info response", it) }
             }
             TuneBudsProtocol.INFO_BATTERY -> TuneBudsProtocol.parseBattery(frame.payload)?.let(::applyBattery)
+            TuneBudsProtocol.INFO_KEY_SETTINGS -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
+                val keys = TuneBudsProtocol.parseKeySettings(frame.payload)
+                val updated = _state.value.keySettings.toMutableMap().apply { putAll(keys) }
+                _state.value = _state.value.copy(
+                    keySettings = updated,
+                    rawKeySettingsHex = formatHex(frame.payload),
+                    lastError = null,
+                )
+            }
             TuneBudsProtocol.INFO_IN_EAR_STATE -> TuneBudsProtocol.parseSupportFlag(frame.payload)?.let { enabled ->
                 _state.value = _state.value.copy(inEarDetectionEnabled = enabled, lastError = null)
             }
@@ -653,6 +669,14 @@ class TuneBudsManager private constructor(context: Context) {
         }
         info[TuneBudsProtocol.INFO_FIRMWARE_VERSION]?.let { payload ->
             TuneBudsProtocol.parseFirmwareVersion(payload)?.let { current = current.copy(firmwareVersion = it) }
+        }
+        info[TuneBudsProtocol.INFO_KEY_SETTINGS]?.let { payload ->
+            val keys = TuneBudsProtocol.parseKeySettings(payload)
+            val merged = current.keySettings.toMutableMap().apply { putAll(keys) }
+            current = current.copy(
+                keySettings = merged,
+                rawKeySettingsHex = formatHex(payload),
+            )
         }
         info[TuneBudsProtocol.INFO_MODEL]?.let { payload ->
             TuneBudsProtocol.parseString(payload)?.let { current = current.copy(model = it) }
@@ -758,6 +782,9 @@ class TuneBudsManager private constructor(context: Context) {
         }
     }
 
+    private fun formatHex(bytes: ByteArray): String =
+        bytes.joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
+
     private fun launchCommand(operation: String, block: suspend () -> Unit) {
         scope.launch {
             if (!client.isConnected()) {
@@ -765,7 +792,7 @@ class TuneBudsManager private constructor(context: Context) {
                 return@launch
             }
             runCatching { block() }
-                .onFailure { error -> updateError("Не удалось $operation:${error.message}") }
+                .onFailure { error -> updateError("Не удалось $operation: ${error.message}") }
         }
     }
 
