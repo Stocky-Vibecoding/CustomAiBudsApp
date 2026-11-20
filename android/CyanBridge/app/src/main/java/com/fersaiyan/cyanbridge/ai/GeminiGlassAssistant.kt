@@ -35,6 +35,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.ConnectionPool
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -42,6 +43,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.concurrent.TimeUnit
@@ -62,6 +64,17 @@ data class GeminiChatMessage(
     val text: String,
     val hasPhoto: Boolean = false,
 )
+
+private class GeminiApiException(
+    val httpCode: Int,
+    val rawBody: String,
+) : IOException("HTTP $httpCode: ${rawBody.take(180)}") {
+    val isGeoBlocked: Boolean
+        get() = httpCode == 400 && (
+            rawBody.contains("User location is not supported", ignoreCase = true) ||
+                rawBody.contains("FAILED_PRECONDITION", ignoreCase = true)
+            )
+}
 
 class GeminiGlassAssistant private constructor(private val context: Context) {
     companion object {
@@ -133,6 +146,8 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
     private val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val httpClient = OkHttpClient.Builder()
+        .connectionPool(ConnectionPool(2, 15, TimeUnit.SECONDS))
+        .retryOnConnectionFailure(true)
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(45, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
@@ -146,9 +161,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
 
     private val _isBusy = MutableStateFlow(false)
     val isBusy: StateFlow<Boolean> = _isBusy.asStateFlow()
-
-    private val _lastTempleLog = MutableStateFlow("Готов к работе")
-    val lastTempleLog: StateFlow<String> = _lastTempleLog.asStateFlow()
 
     private val busyGuard = AtomicBoolean(false)
     private var tts: TextToSpeech? = null
@@ -207,7 +219,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
     fun triggerFromVoiceButton(tuneBudsManager: TuneBudsManager) {
         if (!busyGuard.compareAndSet(false, true)) return
         _isBusy.value = true
-        _lastTempleLog.value = "Запуск через Bluetooth HFP"
         startScoPcmSession(tuneBudsManager, confirmWithGlasses = false)
     }
 
@@ -216,20 +227,15 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             TuneBudsProtocol.AI_CHAT_OPEN_SCO -> {
                 if (!busyGuard.compareAndSet(false, true)) return
                 _isBusy.value = true
-                _lastTempleLog.value = "Дужка: слушаю (SCO)"
                 startScoPcmSession(tuneBudsManager, confirmWithGlasses = true)
             }
             TuneBudsProtocol.AI_CHAT_OPEN_OPUS -> {
                 if (!busyGuard.compareAndSet(false, true)) return
                 _isBusy.value = true
-                _lastTempleLog.value = "Дужка: слушаю (OPUS)"
                 startOpusVoiceSession(tuneBudsManager)
             }
-            TuneBudsProtocol.AI_CHAT_CLOSE -> {
-                stopCaptureSignal?.complete(Unit)
-            }
+            TuneBudsProtocol.AI_CHAT_CLOSE,
             TuneBudsProtocol.AI_CHAT_ERROR -> {
-                _lastTempleLog.value = "Ошибка ИИ на очках (код 255)"
                 stopCaptureSignal?.complete(Unit)
             }
         }
@@ -258,9 +264,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                         } else if (payload.isNotEmpty()) {
                             frames.add(payload)
                         }
-                        if (frames.size == 1) {
-                            _lastTempleLog.value = "Слушаю голос с очков..."
-                        }
                     }
                 }
 
@@ -283,12 +286,8 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                     tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_CLOSE)
                 }
 
-                if (frames.isEmpty()) {
-                    _lastTempleLog.value = "Не получил аудио от очков"
-                    return@launch
-                }
+                if (frames.isEmpty()) return@launch
 
-                _lastTempleLog.value = "Отправляю запрос в Gemini..."
                 val oggBytes = OggOpusMuxer.mux(frames)
                 processNativeAudioWithGemini(
                     audioBytes = oggBytes,
@@ -314,7 +313,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 ) == PackageManager.PERMISSION_GRANTED
                 if (!hasMic) {
                     val msg = "Нет разрешения на микрофон."
-                    _lastTempleLog.value = msg
                     appendMessage(isUser = false, text = msg)
                     if (confirmWithGlasses) tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_CLOSE)
                     return@launch
@@ -329,8 +327,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 stopCaptureSignal = stopSignal
 
                 val usingBtMic = openBluetoothMicRoute()
-                _lastTempleLog.value = if (usingBtMic) "Слушаю (микрофон очков)..." else "Слушаю (микрофон телефона)..."
-
                 val pcmData = try {
                     recordPcmWithVad(preferBluetoothInput = usingBtMic, stopSignal = stopSignal)
                 } finally {
@@ -341,12 +337,8 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                     }
                 }
 
-                if (pcmData == null || pcmData.size < SAMPLE_RATE_HZ / 2) {
-                    _lastTempleLog.value = "Ничего не услышал"
-                    return@launch
-                }
+                if (pcmData == null || pcmData.size < SAMPLE_RATE_HZ / 2) return@launch
 
-                _lastTempleLog.value = "Отправляю запрос в Gemini..."
                 val wavBytes = WavEncoder.encode(pcmData, sampleRate = SAMPLE_RATE_HZ)
                 processNativeAudioWithGemini(
                     audioBytes = wavBytes,
@@ -605,14 +597,12 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         return try {
             val canUseGlasses = tuneBudsManager != null && tuneBudsManager.isConnected()
             val initialPhoto = if (eagerPhoto && canUseGlasses) {
-                _lastTempleLog.value = "Делаю фото с очков..."
-                val photoRes = tuneBudsManager!!.capturePhotoForAiResult()
-                if (photoRes.isFailure) {
-                    val err = photoRes.exceptionOrNull()?.message ?: "Не удалось сделать фото с очков."
-                    deliverReply(err, cfg)
-                    return err
+                val snapped = tuneBudsManager!!.capturePhotoForAi()
+                if (snapped == null) {
+                    val err = tuneBudsManager.state.value.lastError ?: "Не удалось сделать фото с очков."
+                    return deliverReply(err, cfg)
                 }
-                photoRes.getOrNull()
+                snapped
             } else {
                 null
             }
@@ -642,11 +632,9 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
 
             deliverReply(finalText, cfg)
         } catch (error: Throwable) {
-            val errText = "Ошибка Gemini: ${error.message ?: "нет ответа"}"
-            Log.e(TAG, errText, error)
-            _lastTempleLog.value = errText
-            appendMessage(isUser = false, text = errText)
-            errText
+            val userMsg = formatUserError(error)
+            Log.e(TAG, "Gemini ask error: ${error.message}", error)
+            deliverReply(userMsg, cfg)
         } finally {
             busyGuard.set(false)
             _isBusy.value = false
@@ -661,7 +649,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         val cfg = _config.value
         if (cfg.apiKey.isBlank()) {
             val msg = "Укажи API-ключ Gemini в настройках."
-            appendMessage(isUser = false, text = msg)
+            deliverReply(msg, cfg)
             return
         }
 
@@ -696,11 +684,9 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 deliverReply(firstText, cfg)
             }
         } catch (error: Throwable) {
-            val errText = "Ошибка Gemini: ${error.message ?: "нет ответа"}"
-            Log.e(TAG, errText, error)
-            _lastTempleLog.value = errText
-            appendMessage(isUser = false, text = errText)
-            if (cfg.speakResponses) speak("Не удалось связаться с ассистентом.")
+            val userMsg = formatUserError(error)
+            Log.e(TAG, "Gemini voice error: ${error.message}", error)
+            deliverReply(userMsg, cfg)
         }
     }
 
@@ -709,12 +695,8 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         cfg: GeminiConfig,
         tuneBudsManager: TuneBudsManager,
     ): String {
-        _lastTempleLog.value = "Делаю фото с очков..."
-        val photoRes = tuneBudsManager.capturePhotoForAiResult()
-        val photoBytes = photoRes.getOrElse { err ->
-            return err.message ?: "Не удалось получить фото с очков."
-        }
-        _lastTempleLog.value = "Анализирую фото..."
+        val photoBytes = tuneBudsManager.capturePhotoForAi()
+            ?: return tuneBudsManager.state.value.lastError ?: "Не удалось получить фото с очков."
         return sendGeminiWithFallback(
             cfg = cfg,
             prompt = question,
@@ -735,10 +717,24 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             .orEmpty()
     }
 
+    private fun formatUserError(error: Throwable): String = when {
+        error is GeminiApiException && error.isGeoBlocked ->
+            "Gemini заблокирован по региону. Проверь VPN или прокси."
+        error is GeminiApiException && (error.httpCode == 401 || error.httpCode == 403) ->
+            "Неверный API-ключ Gemini."
+        error is GeminiApiException && error.httpCode == 429 ->
+            "Превышен лимит запросов Gemini, попробуй чуть позже."
+        error is GeminiApiException ->
+            "Ошибка сервера Gemini (код ${error.httpCode})."
+        error is IOException ->
+            "Нет связи с сервером Gemini. Проверь интернет или VPN."
+        else ->
+            "Ошибка ассистента: ${error.message ?: "нет ответа"}"
+    }
+
     private fun deliverReply(rawReply: String, cfg: GeminiConfig): String {
         val cleanReply = cleanForSpeech(rawReply)
         appendMessage(isUser = false, text = cleanReply)
-        _lastTempleLog.value = "Ответ получен"
         if (cfg.speakResponses) {
             speak(cleanReply)
         }
@@ -756,8 +752,11 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         var lastError: Throwable? = null
 
         for ((index, modelName) in modelsToTry.withIndex()) {
-            val attempts = if (index == 0) 2 else 1
-            repeat(attempts) { attempt ->
+            var useSearch = true
+            var attemptsLeft = if (index == 0) 3 else 2
+
+            while (attemptsLeft > 0) {
+                attemptsLeft--
                 try {
                     return sendGeminiRequest(
                         cfg = cfg.copy(model = modelName),
@@ -765,29 +764,29 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                         jpegBytes = jpegBytes,
                         audioBytes = audioBytes,
                         audioMime = audioMime,
-                        enableGoogleSearch = true,
+                        enableGoogleSearch = useSearch,
                     )
-                } catch (err: Throwable) {
-                    val msg = err.message.orEmpty()
-                    if (msg.contains("HTTP 400")) {
-                        return sendGeminiRequest(
-                            cfg = cfg.copy(model = modelName),
-                            prompt = prompt,
-                            jpegBytes = jpegBytes,
-                            audioBytes = audioBytes,
-                            audioMime = audioMime,
-                            enableGoogleSearch = false,
-                        )
-                    }
+                } catch (err: GeminiApiException) {
                     lastError = err
-                    val isTransient = msg.contains("HTTP 503") || msg.contains("HTTP 429") || msg.contains("HTTP 500")
+                    if (err.isGeoBlocked) throw err
+                    // Если прокси/модель не принимает google_search — пробуем сразу без него
+                    if (err.httpCode == 400 && useSearch) {
+                        useSearch = false
+                        attemptsLeft = max(attemptsLeft, 1)
+                        continue
+                    }
+                    val isTransient = err.httpCode in setOf(429, 500, 502, 503, 504)
                     if (!isTransient) throw err
-                    Log.w(TAG, "Model $modelName transient error (attempt ${attempt + 1}): $msg")
-                    delay(900L)
+                    Log.w(TAG, "Model $modelName transient HTTP ${err.httpCode}, retries left=$attemptsLeft")
+                    delay(800L)
+                } catch (err: IOException) {
+                    lastError = err
+                    Log.w(TAG, "Model $modelName network error (${err.message}), retries left=$attemptsLeft")
+                    delay(700L)
                 }
             }
         }
-        throw lastError ?: IllegalStateException("Все модели Gemini временно перегружены")
+        throw lastError ?: IOException("Не удалось подключиться к Gemini")
     }
 
     private suspend fun sendGeminiRequest(
@@ -845,11 +844,11 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         httpClient.newCall(request).execute().use { response ->
             val rawBody = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
-                throw IllegalStateException("HTTP ${response.code}: ${rawBody.take(180)}")
+                throw GeminiApiException(response.code, rawBody)
             }
             val root = JSONObject(rawBody)
             val candidates = root.optJSONArray("candidates")
-                ?: throw IllegalStateException("Пустой ответ от модели")
+                ?: throw IOException("Пустой ответ от модели")
             val respParts = candidates
                 .optJSONObject(0)
                 ?.optJSONObject("content")
