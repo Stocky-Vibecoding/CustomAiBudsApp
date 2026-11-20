@@ -204,7 +204,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         }
     }
 
-    /** Запуск по системному HFP VOICE_COMMAND (если очки шлют AT+BVRA). */
     fun triggerFromVoiceButton(tuneBudsManager: TuneBudsManager) {
         if (!busyGuard.compareAndSet(false, true)) return
         _isBusy.value = true
@@ -212,7 +211,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         startScoPcmSession(tuneBudsManager, confirmWithGlasses = false)
     }
 
-    /** Точный обработчик SpeechAiSessionImpl.handleChatState (0xB0 NOTIFICATION). */
     private fun handleAiChatState(event: TuneBudsAiEvent, tuneBudsManager: TuneBudsManager) {
         when (event.chatState) {
             TuneBudsProtocol.AI_CHAT_OPEN_SCO -> {
@@ -237,10 +235,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         }
     }
 
-    /**
-     * Режим 2 (AI_CHAT_OPEN_OPUS):
-     * Очки сами шлют OPUS (кадры по 80 байт / 20 мс) по SPP в 0xB2.
-     */
     private fun startOpusVoiceSession(tuneBudsManager: TuneBudsManager) {
         activeVoiceJob?.cancel()
         activeVoiceJob = scope.launch {
@@ -309,11 +303,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         }
     }
 
-    /**
-     * Режим 1 (AI_CHAT_OPEN_SCO) или HFP VOICE_COMMAND:
-     * Прямая запись 16 кГц PCM через AudioRecord с микрофона очков + автостоп по тишине.
-     * Работает и при свёрнутом приложении, и при заблокированном экране (через FGS + WakeLock).
-     */
     private fun startScoPcmSession(tuneBudsManager: TuneBudsManager, confirmWithGlasses: Boolean) {
         activeVoiceJob?.cancel()
         activeVoiceJob = scope.launch {
@@ -424,7 +413,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         }
 
         val pcmOut = ByteArrayOutputStream(SAMPLE_RATE_HZ * 2 * 6)
-        val frameShorts = ShortArray(320) // 20 ms при 16 кГц
+        val frameShorts = ShortArray(320)
         val frameBytes = ByteArray(frameShorts.size * 2)
 
         try {
@@ -452,7 +441,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 framesRead++
                 val now = System.currentTimeMillis()
 
-                // Калибруем фоновый шум в первые 240 мс
                 if (framesRead <= 12) {
                     noiseFloor = (noiseFloor * 0.7) + (rms * 0.3)
                 } else {
@@ -485,7 +473,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         }
     }
 
-    /** Поднимает Bluetooth-микрофон очков через официальный callback (API 31+ и legacy SCO). */
     private suspend fun openBluetoothMicRoute(): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val btDevice = audioManager.availableCommunicationDevices.firstOrNull {
@@ -619,7 +606,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             val canUseGlasses = tuneBudsManager != null && tuneBudsManager.isConnected()
             val initialPhoto = if (eagerPhoto && canUseGlasses) {
                 _lastTempleLog.value = "Делаю фото с очков..."
-                val photoRes = tuneBudsManager!!.capturePhotoForAi()
+                val photoRes = tuneBudsManager!!.capturePhotoForAiResult()
                 if (photoRes.isFailure) {
                     val err = photoRes.exceptionOrNull()?.message ?: "Не удалось сделать фото с очков."
                     deliverReply(err, cfg)
@@ -723,7 +710,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         tuneBudsManager: TuneBudsManager,
     ): String {
         _lastTempleLog.value = "Делаю фото с очков..."
-        val photoRes = tuneBudsManager.capturePhotoForAi()
+        val photoRes = tuneBudsManager.capturePhotoForAiResult()
         val photoBytes = photoRes.getOrElse { err ->
             return err.message ?: "Не удалось получить фото с очков."
         }
@@ -782,7 +769,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                     )
                 } catch (err: Throwable) {
                     val msg = err.message.orEmpty()
-                    // Если прокси/модель не принимает google_search (HTTP 400) — пробуем без поиска
                     if (msg.contains("HTTP 400")) {
                         return sendGeminiRequest(
                             cfg = cfg.copy(model = modelName),
@@ -911,22 +897,19 @@ private object WavEncoder {
         val blockAlign = channels * bitsPerSample / 8
         val out = ByteArray(44 + pcm.size)
 
-        // RIFF header
         out[0] = 'R'.code.toByte(); out[1] = 'I'.code.toByte(); out[2] = 'F'.code.toByte(); out[3] = 'F'.code.toByte()
         putIntLe(out, 4, 36 + pcm.size)
         out[8] = 'W'.code.toByte(); out[9] = 'A'.code.toByte(); out[10] = 'V'.code.toByte(); out[11] = 'E'.code.toByte()
 
-        // fmt chunk
         out[12] = 'f'.code.toByte(); out[13] = 'm'.code.toByte(); out[14] = 't'.code.toByte(); out[15] = ' '.code.toByte()
         putIntLe(out, 16, 16)
-        putShortLe(out, 20, 1) // PCM
+        putShortLe(out, 20, 1)
         putShortLe(out, 22, channels)
         putIntLe(out, 24, sampleRate)
         putIntLe(out, 28, byteRate)
         putShortLe(out, 32, blockAlign)
         putShortLe(out, 34, bitsPerSample)
 
-        // data chunk
         out[36] = 'd'.code.toByte(); out[37] = 'a'.code.toByte(); out[38] = 't'.code.toByte(); out[39] = 'a'.code.toByte()
         putIntLe(out, 40, pcm.size)
         System.arraycopy(pcm, 0, out, 44, pcm.size)
