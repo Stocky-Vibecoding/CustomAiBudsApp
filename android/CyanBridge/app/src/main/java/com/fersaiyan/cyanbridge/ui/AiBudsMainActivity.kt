@@ -113,6 +113,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -398,13 +399,21 @@ private fun DeviceTab(
                         }
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(
-                                imageVector = if (state.isCharging) Icons.Default.BatteryChargingFull else Icons.Default.BatteryStd,
+                                imageVector = if (isConnected && state.isCharging) {
+                                    Icons.Default.BatteryChargingFull
+                                } else {
+                                    Icons.Default.BatteryStd
+                                },
                                 contentDescription = null,
-                                tint = MaterialTheme.colorScheme.secondary,
+                                tint = if (isConnected && state.batteryPercent != null) {
+                                    MaterialTheme.colorScheme.secondary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                },
                             )
                             Spacer(Modifier.width(4.dp))
                             Text(
-                                text = state.batteryPercent?.let { "$it%" } ?: "--%",
+                                text = if (isConnected) state.batteryPercent?.let { "$it%" } ?: "--%" else "--%",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.SemiBold,
                             )
@@ -423,60 +432,69 @@ private fun DeviceTab(
                             ) {
                                 Icon(Icons.Default.BluetoothConnected, contentDescription = null)
                                 Spacer(Modifier.width(8.dp))
-                                Text("Отключить очки")
+                                Text("Отключить очки", maxLines = 1, softWrap = false)
                             }
                         } else {
                             Button(
                                 onClick = { showConnectDialog = true },
                                 modifier = Modifier.weight(1f),
                                 shape = RoundedCornerShape(12.dp),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
                             ) {
                                 Icon(Icons.Default.Bluetooth, contentDescription = null)
-                                Spacer(Modifier.width(8.dp))
-                                Text("Подключить очки")
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    text = if (!savedMac.isNullOrBlank()) "Подключить" else "Подключить очки",
+                                    maxLines = 1,
+                                    softWrap = false,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
                             }
                             if (!savedMac.isNullOrBlank()) {
                                 OutlinedButton(
                                     onClick = { tuneBuds.connect(savedMac, savedName) },
                                     shape = RoundedCornerShape(12.dp),
+                                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
                                 ) {
-                                    Text("Быстро")
+                                    Text("Быстро", maxLines = 1, softWrap = false)
                                 }
                             }
                         }
                     }
 
-                    state.storage?.let { st ->
-                        val total = (st.usedMiB + st.freeMiB).coerceAtLeast(1L)
-                        val progress = st.usedMiB.toFloat() / total.toFloat()
-                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                            ) {
-                                Text("Память очков", style = MaterialTheme.typography.labelMedium)
-                                Text(
-                                    "Свободно ${st.freeMiB} МБ из $total МБ",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    if (isConnected) {
+                        state.storage?.let { st ->
+                            val total = (st.usedMiB + st.freeMiB).coerceAtLeast(1L)
+                            val progress = st.usedMiB.toFloat() / total.toFloat()
+                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                ) {
+                                    Text("Память очков", style = MaterialTheme.typography.labelMedium)
+                                    Text(
+                                        "Свободно ${st.freeMiB} МБ из $total МБ",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                LinearProgressIndicator(
+                                    progress = { progress.coerceIn(0f, 1f) },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(6.dp)
+                                        .clip(RoundedCornerShape(3.dp)),
                                 )
                             }
-                            LinearProgressIndicator(
-                                progress = { progress.coerceIn(0f, 1f) },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(6.dp)
-                                    .clip(RoundedCornerShape(3.dp)),
+                        }
+
+                        state.mediaCounts?.let { counts ->
+                            Text(
+                                text = "На очках: ${counts.images} фото • ${counts.videos} видео • ${counts.audio} аудио",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
-                    }
-
-                    state.mediaCounts?.let { counts ->
-                        Text(
-                            text = "На очках: ${counts.images} фото • ${counts.videos} видео • ${counts.audio} аудио",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
                     }
 
                     state.lastError?.let { err ->
@@ -640,16 +658,48 @@ private fun DeviceTab(
                     val options = listOf(60 to "1 мин", 180 to "3 мин", 540 to "9 мин", 720 to "12 мин")
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
                         options.forEach { (sec, label) ->
                             val isSelected = normalizedVideoLimitSec == sec
-                            FilterChip(
-                                selected = isSelected,
-                                onClick = { tuneBuds.setVideoLimit(sec) },
-                                label = { Text(label) },
-                                modifier = Modifier.weight(1f),
-                            )
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(36.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(
+                                        if (isSelected) {
+                                            MaterialTheme.colorScheme.primary.copy(alpha = 0.24f)
+                                        } else {
+                                            MaterialTheme.colorScheme.surfaceVariant
+                                        },
+                                    )
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (isSelected) {
+                                            MaterialTheme.colorScheme.primary
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.25f)
+                                        },
+                                        shape = RoundedCornerShape(10.dp),
+                                    )
+                                    .clickable { tuneBuds.setVideoLimit(sec) }
+                                    .padding(horizontal = 4.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(
+                                    text = label,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                                    color = if (isSelected) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurface
+                                    },
+                                    maxLines = 1,
+                                    softWrap = false,
+                                )
+                            }
                         }
                     }
                 }
@@ -1562,6 +1612,34 @@ private fun SettingsSheetContent(
     var speak by remember(cfg) { mutableStateOf(cfg.speakResponses) }
     var promptInput by remember { mutableStateOf("") }
 
+    fun persistIfChanged(draft: GeminiConfig) {
+        val cleaned = draft.copy(
+            apiKey = draft.apiKey.trim(),
+            baseUrl = draft.baseUrl.trim().trimEnd('/').ifBlank {
+                "https://generativelanguage.googleapis.com"
+            },
+            model = draft.model.trim().removePrefix("models/").ifBlank { "gemini-2.5-flash" },
+        )
+        if (cleaned != gemini.config.value) {
+            gemini.updateConfig(cleaned)
+        }
+    }
+
+    val latestDraft by rememberUpdatedState(
+        GeminiConfig(
+            apiKey = apiKey,
+            baseUrl = baseUrl,
+            model = model,
+            speakResponses = speak,
+        ),
+    )
+
+    DisposableEffect(Unit) {
+        onDispose {
+            persistIfChanged(latestDraft)
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -1627,14 +1705,7 @@ private fun SettingsSheetContent(
 
         Button(
             onClick = {
-                gemini.updateConfig(
-                    GeminiConfig(
-                        apiKey = apiKey,
-                        baseUrl = baseUrl,
-                        model = model,
-                        speakResponses = speak,
-                    ),
-                )
+                gemini.updateConfig(latestDraft)
                 Toast.makeText(context, "Настройки ИИ сохранены!", Toast.LENGTH_SHORT).show()
             },
             modifier = Modifier.fillMaxWidth(),
@@ -1688,6 +1759,7 @@ private fun SettingsSheetContent(
                 onClick = {
                     val q = promptInput.trim()
                     if (q.isNotEmpty() && !isBusy) {
+                        persistIfChanged(latestDraft)
                         promptInput = ""
                         scope.launch { gemini.ask(q, withGlassPhoto = false, tuneBudsManager = tuneBuds) }
                     }
