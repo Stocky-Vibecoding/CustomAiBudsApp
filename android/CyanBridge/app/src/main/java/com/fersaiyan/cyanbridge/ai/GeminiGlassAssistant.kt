@@ -1,23 +1,23 @@
 package com.fersaiyan.cyanbridge.ai
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
+import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Build
-import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
+import android.os.PowerManager
 import android.speech.tts.TextToSpeech
 import android.util.Base64
 import android.util.Log
-import android.widget.Toast
 import androidx.core.content.ContextCompat
 import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsAiEvent
 import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsManager
@@ -31,6 +31,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -44,6 +45,9 @@ import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.max
+import kotlin.math.sqrt
 
 data class GeminiConfig(
     val apiKey: String = "",
@@ -59,11 +63,6 @@ data class GeminiChatMessage(
     val hasPhoto: Boolean = false,
 )
 
-private data class GeminiRawResponse(
-    val text: String?,
-    val photoToolQuestion: String?,
-)
-
 class GeminiGlassAssistant private constructor(private val context: Context) {
     companion object {
         private const val TAG = "GeminiGlassAssistant"
@@ -73,21 +72,32 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         private const val KEY_MODEL = "model"
         private const val KEY_SPEAK = "speak_responses"
 
-        private const val SCO_CONNECT_TIMEOUT_MS = 5_000L
-        private const val VOICE_WATCHDOG_MS = 16_000L
+        private const val SAMPLE_RATE_HZ = 16_000
+        private const val SCO_ROUTE_TIMEOUT_MS = 2_800L
+        private const val PCM_NO_SPEECH_TIMEOUT_MS = 4_800L
+        private const val PCM_SILENCE_STOP_MS = 1_300L
+        private const val PCM_MAX_RECORD_MS = 12_000L
+
         private const val OPUS_FIRST_PACKET_TIMEOUT_MS = 5_000L
-        private const val OPUS_SILENCE_FINISH_MS = 1_400L
+        private const val OPUS_SILENCE_FINISH_MS = 1_300L
         private const val OPUS_MAX_RECORD_MS = 12_000L
         private const val OPUS_FRAME_SIZE = 80
-        private const val TOOL_CAPTURE_PHOTO = "capture_glasses_photo"
+
+        private const val NEED_PHOTO_PREFIX = "NEED_PHOTO:"
 
         private const val GLASSES_SYSTEM_PROMPT =
-            "Ты — голосовой ИИ-ассистент в умных очках. Твои ответы сразу озвучиваются голосом (TTS) прямо в уши пользователю. " +
+            "Ты — голосовой ИИ-ассистент в умных очках. Твои ответы сразу озвучиваются голосом (TTS) прямо в уши. " +
                 "Отвечай максимально кратко, чётко и по делу (1–3 предложения). " +
-                "Никогда не используй Markdown, звёздочки, решётки, тире для списков, эмодзи и любые лишние символы — " +
+                "Никогда не используй Markdown, звёздочки, решётки, тире для списков, эмодзи и технические термины — " +
                 "только чистый живой разговорный текст на русском языке. " +
-                "Если пользователь просит посмотреть, описать, прочитать, перевести или распознать что-то перед глазами — " +
-                "обязательно вызови инструмент capture_glasses_photo."
+                "Если нужно узнать погоду, новости, курсы или актуальные факты — используй поиск Google."
+
+        private const val VISION_ROUTER_INSTRUCTION =
+            "Если пользователь просит посмотреть, глянуть, описать, прочитать, перевести, распознать или проверить " +
+                "что-то перед глазами (например: смотри, посмотри, глянь, что это, что передо мной, прочитай, переведи это) — " +
+                "НЕ отвечай текстом от себя, а верни строго одну строку в формате: " +
+                "NEED_PHOTO: <краткий вопрос пользователя на русском>. " +
+                "Во всех остальных случаях сразу дай краткий голосовой ответ на вопрос пользователя."
 
         private val FALLBACK_MODELS = listOf(
             "gemini-2.5-flash-lite",
@@ -96,6 +106,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
 
         private val VISION_TRIGGERS = listOf(
             "посмотри",
+            "смотри",
             "глянь",
             "взгляни",
             "что видишь",
@@ -119,7 +130,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
 
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
@@ -136,23 +147,29 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
     private val _isBusy = MutableStateFlow(false)
     val isBusy: StateFlow<Boolean> = _isBusy.asStateFlow()
 
-    private val _lastTempleLog = MutableStateFlow("Готов к работе (ожидание 0xB0 / HFP)")
+    private val _lastTempleLog = MutableStateFlow("Готов к работе")
     val lastTempleLog: StateFlow<String> = _lastTempleLog.asStateFlow()
 
+    private val busyGuard = AtomicBoolean(false)
     private var tts: TextToSpeech? = null
     private var ttsReady = false
-    private var speechRecognizer: SpeechRecognizer? = null
     private var glassesListenerJob: Job? = null
     private var activeVoiceJob: Job? = null
-    private var opusStopSignal: CompletableDeferred<Unit>? = null
-    private var scoReceiver: BroadcastReceiver? = null
-    private var scoOpened = false
+    private var stopCaptureSignal: CompletableDeferred<Unit>? = null
+    private var legacyScoReceiver: BroadcastReceiver? = null
+    private var audioRouteActive = false
 
     init {
         tts = TextToSpeech(context.applicationContext) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 val res = tts?.setLanguage(Locale("ru", "RU"))
                 ttsReady = res != TextToSpeech.LANG_MISSING_DATA && res != TextToSpeech.LANG_NOT_SUPPORTED
+                tts?.setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build(),
+                )
             }
         }
     }
@@ -187,365 +204,394 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         }
     }
 
-    /** Запуск по системному HFP VOICE_COMMAND (если очки шлют AT+BVRA вместо 0xB0). */
+    /** Запуск по системному HFP VOICE_COMMAND (если очки шлют AT+BVRA). */
     fun triggerFromVoiceButton(tuneBudsManager: TuneBudsManager) {
-        if (_isBusy.value) return
+        if (!busyGuard.compareAndSet(false, true)) return
+        _isBusy.value = true
         _lastTempleLog.value = "Запуск через Bluetooth HFP"
-        startScoVoiceSession(tuneBudsManager, confirmWithGlasses = false)
+        startScoPcmSession(tuneBudsManager, confirmWithGlasses = false)
     }
 
     /** Точный обработчик SpeechAiSessionImpl.handleChatState (0xB0 NOTIFICATION). */
     private fun handleAiChatState(event: TuneBudsAiEvent, tuneBudsManager: TuneBudsManager) {
         when (event.chatState) {
             TuneBudsProtocol.AI_CHAT_OPEN_SCO -> {
-                if (_isBusy.value) return
-                _lastTempleLog.value = "Дужка: старт ИИ (режим SCO)"
-                startScoVoiceSession(tuneBudsManager, confirmWithGlasses = true)
+                if (!busyGuard.compareAndSet(false, true)) return
+                _isBusy.value = true
+                _lastTempleLog.value = "Дужка: слушаю (SCO)"
+                startScoPcmSession(tuneBudsManager, confirmWithGlasses = true)
             }
             TuneBudsProtocol.AI_CHAT_OPEN_OPUS -> {
-                if (_isBusy.value) return
-                _lastTempleLog.value = "Дужка: старт ИИ (поток OPUS 0xB2)"
+                if (!busyGuard.compareAndSet(false, true)) return
+                _isBusy.value = true
+                _lastTempleLog.value = "Дужка: слушаю (OPUS)"
                 startOpusVoiceSession(tuneBudsManager)
             }
             TuneBudsProtocol.AI_CHAT_CLOSE -> {
-                opusStopSignal?.complete(Unit)
-                if (_isBusy.value && speechRecognizer != null) {
-                    mainHandler.post { runCatching { speechRecognizer?.stopListening() } }
-                }
+                stopCaptureSignal?.complete(Unit)
             }
             TuneBudsProtocol.AI_CHAT_ERROR -> {
-                _lastTempleLog.value = "Очки сообщили об ошибке ИИ (код 255)"
-                opusStopSignal?.complete(Unit)
+                _lastTempleLog.value = "Ошибка ИИ на очках (код 255)"
+                stopCaptureSignal?.complete(Unit)
             }
         }
     }
 
     /**
      * Режим 2 (AI_CHAT_OPEN_OPUS):
-     * Очки шлют OPUS (кадры по 80 байт / 20 мс) по SPP в 0xB2.
-     * Пакуем в Ogg Opus и отправляем в Gemini с инструментом capture_glasses_photo:
-     * если пользователь сказал «посмотри / что передо мной», очки автоматически сделают фото.
+     * Очки сами шлют OPUS (кадры по 80 байт / 20 мс) по SPP в 0xB2.
      */
     private fun startOpusVoiceSession(tuneBudsManager: TuneBudsManager) {
         activeVoiceJob?.cancel()
         activeVoiceJob = scope.launch {
-            _isBusy.value = true
-            tts?.stop()
-            withContext(Dispatchers.Main) {
-                Toast.makeText(context, "Слушаю (OPUS с очков)...", Toast.LENGTH_SHORT).show()
-            }
-
-            val frames = ArrayList<ByteArray>(256)
-            val stopSignal = CompletableDeferred<Unit>()
-            opusStopSignal = stopSignal
-
-            var lastPacketAtMs = 0L
-            val collectorJob = launch {
-                tuneBudsManager.aiOpusPackets.collect { payload ->
-                    lastPacketAtMs = System.currentTimeMillis()
-                    if (payload.size > OPUS_FRAME_SIZE && payload.size % OPUS_FRAME_SIZE == 0) {
-                        var off = 0
-                        while (off < payload.size) {
-                            frames.add(payload.copyOfRange(off, off + OPUS_FRAME_SIZE))
-                            off += OPUS_FRAME_SIZE
-                        }
-                    } else if (payload.isNotEmpty()) {
-                        frames.add(payload)
-                    }
-                    if (frames.size == 1) {
-                        _lastTempleLog.value = "Принимаю голос с очков..."
-                    }
-                }
-            }
-
+            val wakeLock = acquireWakeLock()
             try {
-                // Асинхронное подтверждение открытия потока (как в SpeechSessionImpl.executeOpenCommand)
-                tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_OPEN_OPUS)
+                tts?.stop()
+                val frames = ArrayList<ByteArray>(256)
+                val stopSignal = CompletableDeferred<Unit>()
+                stopCaptureSignal = stopSignal
 
-                val startedAt = System.currentTimeMillis()
-                while (!stopSignal.isCompleted) {
-                    delay(120L)
-                    val now = System.currentTimeMillis()
-                    if (now - startedAt >= OPUS_MAX_RECORD_MS) break
-                    if (lastPacketAtMs == 0L) {
-                        if (now - startedAt >= OPUS_FIRST_PACKET_TIMEOUT_MS) break
-                    } else {
-                        if (now - lastPacketAtMs >= OPUS_SILENCE_FINISH_MS) break
+                var lastPacketAtMs = 0L
+                val collectorJob = launch {
+                    tuneBudsManager.aiOpusPackets.collect { payload ->
+                        lastPacketAtMs = System.currentTimeMillis()
+                        if (payload.size > OPUS_FRAME_SIZE && payload.size % OPUS_FRAME_SIZE == 0) {
+                            var off = 0
+                            while (off < payload.size) {
+                                frames.add(payload.copyOfRange(off, off + OPUS_FRAME_SIZE))
+                                off += OPUS_FRAME_SIZE
+                            }
+                        } else if (payload.isNotEmpty()) {
+                            frames.add(payload)
+                        }
+                        if (frames.size == 1) {
+                            _lastTempleLog.value = "Слушаю голос с очков..."
+                        }
                     }
                 }
+
+                try {
+                    tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_OPEN_OPUS)
+                    val startedAt = System.currentTimeMillis()
+                    while (!stopSignal.isCompleted && isActive) {
+                        delay(100L)
+                        val now = System.currentTimeMillis()
+                        if (now - startedAt >= OPUS_MAX_RECORD_MS) break
+                        if (lastPacketAtMs == 0L) {
+                            if (now - startedAt >= OPUS_FIRST_PACKET_TIMEOUT_MS) break
+                        } else if (now - lastPacketAtMs >= OPUS_SILENCE_FINISH_MS) {
+                            break
+                        }
+                    }
+                } finally {
+                    collectorJob.cancel()
+                    stopCaptureSignal = null
+                    tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_CLOSE)
+                }
+
+                if (frames.isEmpty()) {
+                    _lastTempleLog.value = "Не получил аудио от очков"
+                    return@launch
+                }
+
+                _lastTempleLog.value = "Отправляю запрос в Gemini..."
+                val oggBytes = OggOpusMuxer.mux(frames)
+                processNativeAudioWithGemini(
+                    audioBytes = oggBytes,
+                    audioMime = "audio/ogg",
+                    tuneBudsManager = tuneBudsManager,
+                )
             } finally {
-                collectorJob.cancel()
-                opusStopSignal = null
-                tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_CLOSE)
-            }
-
-            if (frames.isEmpty()) {
-                _lastTempleLog.value = "Очки не прислали OPUS-аудио"
+                releaseWakeLock(wakeLock)
+                busyGuard.set(false)
                 _isBusy.value = false
-                return@launch
             }
-
-            val durationSec = (frames.size * 20) / 1000f
-            _lastTempleLog.value = "Получено %.1f сек голоса — отправляю в Gemini...".format(durationSec)
-
-            val oggBytes = OggOpusMuxer.mux(frames)
-            askWithNativeAudio(
-                audioBytes = oggBytes,
-                audioMime = "audio/ogg",
-                tuneBudsManager = tuneBudsManager,
-            )
         }
     }
 
     /**
-     * Режим 1 (AI_CHAT_OPEN_SCO) или системный HFP VOICE_COMMAND:
-     * Поднимает Bluetooth SCO по системному BroadcastReceiver (как в ScoReader.java).
+     * Режим 1 (AI_CHAT_OPEN_SCO) или HFP VOICE_COMMAND:
+     * Прямая запись 16 кГц PCM через AudioRecord с микрофона очков + автостоп по тишине.
+     * Работает и при свёрнутом приложении, и при заблокированном экране (через FGS + WakeLock).
      */
-    private fun startScoVoiceSession(tuneBudsManager: TuneBudsManager, confirmWithGlasses: Boolean) {
+    private fun startScoPcmSession(tuneBudsManager: TuneBudsManager, confirmWithGlasses: Boolean) {
         activeVoiceJob?.cancel()
         activeVoiceJob = scope.launch {
-            val hasMic = ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.RECORD_AUDIO,
-            ) == PackageManager.PERMISSION_GRANTED
-
-            if (!hasMic) {
-                val msg = "Нет разрешения на микрофон"
-                _lastTempleLog.value = msg
-                appendMessage(isUser = false, text = msg)
-                if (confirmWithGlasses) tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_CLOSE)
-                return@launch
-            }
-
-            _isBusy.value = true
-            tts?.stop()
-
-            if (confirmWithGlasses) {
-                tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_OPEN_SCO)
-            }
-
-            val scoReady = openScoAndAwaitConnected()
-            _lastTempleLog.value = if (scoReady) "Слушаю (микрофон очков SCO)..." else "Слушаю (микрофон телефона)..."
-
-            withContext(Dispatchers.Main) {
-                val recognizer = createBestRecognizer()
-                if (recognizer == null) {
-                    val msg = "Сервис распознавания речи не найден"
+            val wakeLock = acquireWakeLock()
+            try {
+                val hasMic = ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.RECORD_AUDIO,
+                ) == PackageManager.PERMISSION_GRANTED
+                if (!hasMic) {
+                    val msg = "Нет разрешения на микрофон."
                     _lastTempleLog.value = msg
                     appendMessage(isUser = false, text = msg)
-                    closeSco()
-                    _isBusy.value = false
                     if (confirmWithGlasses) tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_CLOSE)
-                    return@withContext
+                    return@launch
                 }
 
-                Toast.makeText(context, "Слушаю... Говори", Toast.LENGTH_SHORT).show()
-                destroyRecognizer()
-                speechRecognizer = recognizer
+                tts?.stop()
+                if (confirmWithGlasses) {
+                    tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_OPEN_SCO)
+                }
 
-                val watchdogJob = scope.launch(Dispatchers.Main) {
-                    delay(VOICE_WATCHDOG_MS)
-                    if (_isBusy.value && speechRecognizer != null) {
-                        _lastTempleLog.value = "Таймаут ожидания речи"
-                        destroyRecognizer()
-                        closeSco()
-                        _isBusy.value = false
-                        if (confirmWithGlasses) tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_CLOSE)
+                val stopSignal = CompletableDeferred<Unit>()
+                stopCaptureSignal = stopSignal
+
+                val usingBtMic = openBluetoothMicRoute()
+                _lastTempleLog.value = if (usingBtMic) "Слушаю (микрофон очков)..." else "Слушаю (микрофон телефона)..."
+
+                val pcmData = try {
+                    recordPcmWithVad(preferBluetoothInput = usingBtMic, stopSignal = stopSignal)
+                } finally {
+                    stopCaptureSignal = null
+                    closeAudioRoute()
+                    if (confirmWithGlasses) {
+                        tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_CLOSE)
                     }
                 }
 
-                recognizer.setRecognitionListener(
-                    object : RecognitionListener {
-                        override fun onReadyForSpeech(params: Bundle?) {
-                            _lastTempleLog.value = "Говорите..."
-                        }
+                if (pcmData == null || pcmData.size < SAMPLE_RATE_HZ / 2) {
+                    _lastTempleLog.value = "Ничего не услышал"
+                    return@launch
+                }
 
-                        override fun onBeginningOfSpeech() = Unit
-                        override fun onRmsChanged(rmsdB: Float) = Unit
-                        override fun onBufferReceived(buffer: ByteArray?) = Unit
-                        override fun onEndOfSpeech() {
-                            _lastTempleLog.value = "Распознаю..."
-                        }
-
-                        override fun onError(error: Int) {
-                            watchdogJob.cancel()
-                            destroyRecognizer()
-                            closeSco()
-                            val errMsg = speechErrorToRussian(error)
-                            Log.w(TAG, "SpeechRecognizer error=$error ($errMsg)")
-                            _lastTempleLog.value = errMsg
-                            _isBusy.value = false
-                            if (confirmWithGlasses) tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_CLOSE)
-                        }
-
-                        override fun onResults(results: Bundle?) {
-                            watchdogJob.cancel()
-                            destroyRecognizer()
-                            closeSco()
-                            if (confirmWithGlasses) tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_CLOSE)
-
-                            val spoken = results
-                                ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                                ?.firstOrNull()
-                                ?.trim()
-                                .orEmpty()
-
-                            if (spoken.isBlank()) {
-                                _lastTempleLog.value = "Речь не распознана"
-                                _isBusy.value = false
-                                return
-                            }
-
-                            val lower = spoken.lowercase(Locale("ru", "RU"))
-                            val wantsPhoto = VISION_TRIGGERS.any { lower.contains(it) }
-
-                            _lastTempleLog.value = if (wantsPhoto) "Запрос с фото: «$spoken»" else "Запрос: «$spoken»"
-                            scope.launch {
-                                ask(
-                                    prompt = spoken,
-                                    withGlassPhoto = wantsPhoto,
-                                    tuneBudsManager = tuneBudsManager,
-                                )
-                            }
-                        }
-
-                        override fun onPartialResults(partialResults: Bundle?) {
-                            val partial = partialResults
-                                ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                                ?.firstOrNull()
-                                ?.trim()
-                            if (!partial.isNullOrBlank()) {
-                                _lastTempleLog.value = "Слышу: «$partial»"
-                            }
-                        }
-
-                        override fun onEvent(eventType: Int, params: Bundle?) = Unit
-                    },
+                _lastTempleLog.value = "Отправляю запрос в Gemini..."
+                val wavBytes = WavEncoder.encode(pcmData, sampleRate = SAMPLE_RATE_HZ)
+                processNativeAudioWithGemini(
+                    audioBytes = wavBytes,
+                    audioMime = "audio/wav",
+                    tuneBudsManager = tuneBudsManager,
                 )
-
-                val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
-                    putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2_200L)
-                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-                }
-                runCatching {
-                    recognizer.startListening(intent)
-                }.onFailure { err ->
-                    watchdogJob.cancel()
-                    destroyRecognizer()
-                    closeSco()
-                    _lastTempleLog.value = "Ошибка микрофона: ${err.message}"
-                    _isBusy.value = false
-                    if (confirmWithGlasses) tuneBudsManager.setAiChatState(TuneBudsProtocol.AI_CHAT_CLOSE)
-                }
+            } finally {
+                closeAudioRoute()
+                releaseWakeLock(wakeLock)
+                busyGuard.set(false)
+                _isBusy.value = false
             }
         }
     }
 
-    /** Точный аналог ScoReader.java: подписка на ACTION_SCO_AUDIO_STATE_UPDATED + ожидание CONNECTED. */
-    private suspend fun openScoAndAwaitConnected(): Boolean {
-        @Suppress("DEPRECATION")
-        if (!audioManager.isBluetoothScoAvailableOffCall) return false
+    @SuppressLint("MissingPermission")
+    private fun recordPcmWithVad(
+        preferBluetoothInput: Boolean,
+        stopSignal: CompletableDeferred<Unit>,
+    ): ByteArray? {
+        val minBuf = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE_HZ,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+        ).coerceAtLeast(SAMPLE_RATE_HZ / 5)
 
-        val connected = CompletableDeferred<Boolean>()
-        var stickyConfirmJob: Job? = null
-
-        val receiver = object : BroadcastReceiver() {
-            override fun onReceive(c: Context?, intent: Intent?) {
-                val state = intent?.getIntExtra(AudioManager.EXTRA_SCO_AUDIO_STATE, -1) ?: -1
-                if (isInitialStickyBroadcast) {
-                    if (state == AudioManager.SCO_AUDIO_STATE_CONNECTED) {
-                        stickyConfirmJob = scope.launch {
-                            delay(800L)
-                            connected.complete(true)
-                        }
-                    }
-                    return
-                }
-                stickyConfirmJob?.cancel()
-                if (state == AudioManager.SCO_AUDIO_STATE_CONNECTED) {
-                    connected.complete(true)
-                }
-            }
+        val primarySource = if (preferBluetoothInput) {
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION
+        } else {
+            MediaRecorder.AudioSource.VOICE_RECOGNITION
         }
 
-        closeSco()
-        scoReceiver = receiver
-        ContextCompat.registerReceiver(
-            context,
-            receiver,
-            IntentFilter(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED),
-            ContextCompat.RECEIVER_NOT_EXPORTED,
+        var record = AudioRecord(
+            primarySource,
+            SAMPLE_RATE_HZ,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            minBuf * 2,
         )
-
-        runCatching {
-            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            @Suppress("DEPRECATION")
-            audioManager.startBluetoothSco()
-            @Suppress("DEPRECATION")
-            audioManager.isBluetoothScoOn = true
-            scoOpened = true
-        }.onFailure {
-            closeSco()
-            return false
+        if (record.state != AudioRecord.STATE_INITIALIZED) {
+            record.release()
+            record = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                SAMPLE_RATE_HZ,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                minBuf * 2,
+            )
+            if (record.state != AudioRecord.STATE_INITIALIZED) {
+                record.release()
+                return null
+            }
         }
 
-        val ok = withTimeoutOrNull(SCO_CONNECT_TIMEOUT_MS) { connected.await() } == true
-        stickyConfirmJob?.cancel()
-        if (!ok) {
-            closeSco()
+        if (preferBluetoothInput && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val btInput = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull {
+                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                    (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                        it.type == AudioDeviceInfo.TYPE_BLE_HEADSET)
+            }
+            if (btInput != null) {
+                record.preferredDevice = btInput
+            }
         }
-        return ok
+
+        val pcmOut = ByteArrayOutputStream(SAMPLE_RATE_HZ * 2 * 6)
+        val frameShorts = ShortArray(320) // 20 ms при 16 кГц
+        val frameBytes = ByteArray(frameShorts.size * 2)
+
+        try {
+            record.startRecording()
+            val startedAt = System.currentTimeMillis()
+            var speechDetected = false
+            var lastVoiceAt = startedAt
+            var noiseFloor = 220.0
+            var framesRead = 0
+
+            while (!stopSignal.isCompleted) {
+                val read = record.read(frameShorts, 0, frameShorts.size)
+                if (read <= 0) break
+
+                var sumSq = 0.0
+                for (i in 0 until read) {
+                    val s = frameShorts[i].toInt()
+                    sumSq += s.toDouble() * s.toDouble()
+                    frameBytes[i * 2] = (s and 0xFF).toByte()
+                    frameBytes[i * 2 + 1] = ((s ushr 8) and 0xFF).toByte()
+                }
+                pcmOut.write(frameBytes, 0, read * 2)
+
+                val rms = sqrt(sumSq / read)
+                framesRead++
+                val now = System.currentTimeMillis()
+
+                // Калибруем фоновый шум в первые 240 мс
+                if (framesRead <= 12) {
+                    noiseFloor = (noiseFloor * 0.7) + (rms * 0.3)
+                } else {
+                    val threshold = max(340.0, noiseFloor * 2.7)
+                    if (rms >= threshold) {
+                        speechDetected = true
+                        lastVoiceAt = now
+                    } else if (!speechDetected) {
+                        noiseFloor = (noiseFloor * 0.92) + (rms * 0.08)
+                    }
+                }
+
+                val elapsed = now - startedAt
+                if (elapsed >= PCM_MAX_RECORD_MS) break
+                if (!speechDetected && elapsed >= PCM_NO_SPEECH_TIMEOUT_MS) break
+                if (speechDetected && (now - lastVoiceAt) >= PCM_SILENCE_STOP_MS) break
+            }
+
+            return if (speechDetected) pcmOut.toByteArray() else null
+        } catch (err: Throwable) {
+            Log.w(TAG, "AudioRecord capture error: ${err.message}")
+            return null
+        } finally {
+            runCatching {
+                if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                    record.stop()
+                }
+            }
+            runCatching { record.release() }
+        }
     }
 
-    private fun closeSco() {
-        scoReceiver?.let { r ->
-            runCatching { context.unregisterReceiver(r) }
-        }
-        scoReceiver = null
-        if (scoOpened) {
+    /** Поднимает Bluetooth-микрофон очков через официальный callback (API 31+ и legacy SCO). */
+    private suspend fun openBluetoothMicRoute(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val btDevice = audioManager.availableCommunicationDevices.firstOrNull {
+                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+            } ?: audioManager.availableCommunicationDevices.firstOrNull {
+                it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+            } ?: return false
+
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            audioRouteActive = true
+
+            if (audioManager.communicationDevice?.id == btDevice.id) {
+                return true
+            }
+
+            val switched = CompletableDeferred<Boolean>()
+            val listener = AudioManager.OnCommunicationDeviceChangedListener { device ->
+                if (device?.id == btDevice.id) {
+                    switched.complete(true)
+                }
+            }
+            val executor = ContextCompat.getMainExecutor(context)
+            audioManager.addOnCommunicationDeviceChangedListener(executor, listener)
+            return try {
+                val accepted = audioManager.setCommunicationDevice(btDevice)
+                if (!accepted) {
+                    closeAudioRoute()
+                    false
+                } else {
+                    val ok = withTimeoutOrNull(SCO_ROUTE_TIMEOUT_MS) { switched.await() } == true ||
+                        audioManager.communicationDevice?.id == btDevice.id
+                    if (!ok) closeAudioRoute()
+                    ok
+                }
+            } finally {
+                runCatching { audioManager.removeOnCommunicationDeviceChangedListener(listener) }
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            if (!audioManager.isBluetoothScoAvailableOffCall) return false
+
+            val connected = CompletableDeferred<Boolean>()
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(c: Context?, intent: Intent?) {
+                    val state = intent?.getIntExtra(AudioManager.EXTRA_SCO_AUDIO_STATE, -1) ?: -1
+                    if (state == AudioManager.SCO_AUDIO_STATE_CONNECTED) {
+                        connected.complete(true)
+                    }
+                }
+            }
+            closeAudioRoute()
+            legacyScoReceiver = receiver
+            ContextCompat.registerReceiver(
+                context,
+                receiver,
+                IntentFilter(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED),
+                ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+
             runCatching {
+                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
                 @Suppress("DEPRECATION")
-                audioManager.stopBluetoothSco()
+                audioManager.startBluetoothSco()
+                @Suppress("DEPRECATION")
+                audioManager.isBluetoothScoOn = true
+                audioRouteActive = true
+            }.onFailure {
+                closeAudioRoute()
+                return false
+            }
+
+            val ok = withTimeoutOrNull(SCO_ROUTE_TIMEOUT_MS) { connected.await() } == true
+            if (!ok) closeAudioRoute()
+            return ok
+        }
+    }
+
+    private fun closeAudioRoute() {
+        legacyScoReceiver?.let { r -> runCatching { context.unregisterReceiver(r) } }
+        legacyScoReceiver = null
+        if (!audioRouteActive) return
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                audioManager.clearCommunicationDevice()
+            } else {
                 @Suppress("DEPRECATION")
                 audioManager.isBluetoothScoOn = false
-                audioManager.mode = AudioManager.MODE_NORMAL
+                @Suppress("DEPRECATION")
+                audioManager.stopBluetoothSco()
             }
-            scoOpened = false
+            audioManager.mode = AudioManager.MODE_NORMAL
         }
+        audioRouteActive = false
     }
 
-    private fun createBestRecognizer(): SpeechRecognizer? {
-        if (SpeechRecognizer.isRecognitionAvailable(context)) {
-            return runCatching { SpeechRecognizer.createSpeechRecognizer(context.applicationContext) }.getOrNull()
+    private fun acquireWakeLock(): PowerManager.WakeLock? = runCatching {
+        powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AiBuds:VoiceSession").apply {
+            setReferenceCounted(false)
+            acquire(60_000L)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-            SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
-        ) {
-            return runCatching {
-                SpeechRecognizer.createOnDeviceSpeechRecognizer(context.applicationContext)
-            }.getOrNull()
+    }.getOrNull()
+
+    private fun releaseWakeLock(wl: PowerManager.WakeLock?) {
+        runCatching {
+            if (wl != null && wl.isHeld) wl.release()
         }
-        return null
-    }
-
-    private fun destroyRecognizer() {
-        runCatching { speechRecognizer?.cancel() }
-        runCatching { speechRecognizer?.destroy() }
-        speechRecognizer = null
-    }
-
-    private fun speechErrorToRussian(code: Int): String = when (code) {
-        SpeechRecognizer.ERROR_AUDIO -> "Ошибка записи аудио"
-        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Нет разрешения на микрофон"
-        SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Нет сети для распознавания"
-        SpeechRecognizer.ERROR_NO_MATCH -> "Речь не распознана"
-        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "Ничего не услышал"
-        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Микрофон занят"
-        SpeechRecognizer.ERROR_SERVER -> "Сервер речи недоступен"
-        else -> "Ошибка речи (код $code)"
     }
 
     suspend fun ask(
@@ -557,11 +603,14 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         if (cfg.apiKey.isBlank()) {
             val msg = "Укажи API-ключ Gemini в настройках."
             appendMessage(isUser = false, text = msg)
-            _isBusy.value = false
             return msg
         }
 
+        if (!busyGuard.compareAndSet(false, true)) {
+            return "Подожди, обрабатываю предыдущий запрос."
+        }
         _isBusy.value = true
+
         val lower = prompt.lowercase(Locale("ru", "RU"))
         val eagerPhoto = withGlassPhoto || VISION_TRIGGERS.any { lower.contains(it) }
         appendMessage(isUser = true, text = prompt, hasPhoto = eagerPhoto)
@@ -570,47 +619,41 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             val canUseGlasses = tuneBudsManager != null && tuneBudsManager.isConnected()
             val initialPhoto = if (eagerPhoto && canUseGlasses) {
                 _lastTempleLog.value = "Делаю фото с очков..."
-                tuneBudsManager!!.capturePhotoForAi(timeoutMs = 15_000L)
+                val photoRes = tuneBudsManager!!.capturePhotoForAi()
+                if (photoRes.isFailure) {
+                    val err = photoRes.exceptionOrNull()?.message ?: "Не удалось сделать фото с очков."
+                    deliverReply(err, cfg)
+                    return err
+                }
+                photoRes.getOrNull()
             } else {
                 null
             }
 
-            val firstResp = sendGeminiWithFallback(
+            val firstText = sendGeminiWithFallback(
                 cfg = cfg,
-                prompt = prompt,
+                prompt = if (initialPhoto == null && canUseGlasses) {
+                    "$VISION_ROUTER_INSTRUCTION\n\nЗапрос пользователя: $prompt"
+                } else {
+                    prompt
+                },
                 jpegBytes = initialPhoto,
                 audioBytes = null,
                 audioMime = null,
-                allowPhotoTool = initialPhoto == null && canUseGlasses,
             )
 
-            val finalText = if (firstResp.photoToolQuestion != null && canUseGlasses) {
-                _lastTempleLog.value = "Делаю фото с очков по запросу..."
-                val snappedPhoto = tuneBudsManager!!.capturePhotoForAi(timeoutMs = 15_000L)
-                if (snappedPhoto != null && snappedPhoto.isNotEmpty()) {
-                    val secondResp = sendGeminiWithFallback(
-                        cfg = cfg,
-                        prompt = firstResp.photoToolQuestion.ifBlank { prompt },
-                        jpegBytes = snappedPhoto,
-                        audioBytes = null,
-                        audioMime = null,
-                        allowPhotoTool = false,
-                    )
-                    secondResp.text ?: "Модель вернула пустой текст."
-                } else {
-                    "Не удалось получить фото с очков."
-                }
+            val needPhotoQuestion = extractNeedPhotoQuestion(firstText)
+            val finalText = if (needPhotoQuestion != null && canUseGlasses) {
+                snapAndAskWithPhoto(
+                    question = needPhotoQuestion.ifBlank { prompt },
+                    cfg = cfg,
+                    tuneBudsManager = tuneBudsManager!!,
+                )
             } else {
-                firstResp.text ?: "Модель вернула пустой текст."
+                firstText
             }
 
-            val cleanReply = cleanForSpeech(finalText)
-            appendMessage(isUser = false, text = cleanReply)
-            _lastTempleLog.value = "Ответ получен"
-            if (cfg.speakResponses) {
-                speak(cleanReply)
-            }
-            cleanReply
+            deliverReply(finalText, cfg)
         } catch (error: Throwable) {
             val errText = "Ошибка Gemini: ${error.message ?: "нет ответа"}"
             Log.e(TAG, errText, error)
@@ -618,11 +661,12 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             appendMessage(isUser = false, text = errText)
             errText
         } finally {
+            busyGuard.set(false)
             _isBusy.value = false
         }
     }
 
-    private suspend fun askWithNativeAudio(
+    private suspend fun processNativeAudioWithGemini(
         audioBytes: ByteArray,
         audioMime: String,
         tuneBudsManager: TuneBudsManager,
@@ -631,64 +675,87 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         if (cfg.apiKey.isBlank()) {
             val msg = "Укажи API-ключ Gemini в настройках."
             appendMessage(isUser = false, text = msg)
-            _isBusy.value = false
             return
         }
 
         try {
             val canUseGlasses = tuneBudsManager.isConnected()
-            val firstResp = sendGeminiWithFallback(
+            val prompt = if (canUseGlasses) {
+                "Выслушай голосовой запрос в аудио.\n$VISION_ROUTER_INSTRUCTION"
+            } else {
+                "Выслушай голосовой запрос в аудио и сразу дай краткий ответ на русском."
+            }
+
+            val firstText = sendGeminiWithFallback(
                 cfg = cfg,
-                prompt = "Выслушай голосовой запрос пользователя в прикреплённом аудио. " +
-                    "Если он просит посмотреть, описать, прочитать или распознать что-то перед глазами — вызови capture_glasses_photo. " +
-                    "Иначе сразу ответь кратко и по делу.",
+                prompt = prompt,
                 jpegBytes = null,
                 audioBytes = audioBytes,
                 audioMime = audioMime,
-                allowPhotoTool = canUseGlasses,
             )
 
-            val finalText = if (firstResp.photoToolQuestion != null) {
-                val question = firstResp.photoToolQuestion.ifBlank { "Опиши кратко, что сейчас передо мной." }
+            val needPhotoQuestion = extractNeedPhotoQuestion(firstText)
+            if (needPhotoQuestion != null && canUseGlasses) {
+                val question = needPhotoQuestion.ifBlank { "Опиши кратко, что сейчас передо мной." }
                 appendMessage(isUser = true, text = question, hasPhoto = true)
-                _lastTempleLog.value = "Делаю фото с очков..."
-                val photoBytes = if (canUseGlasses) {
-                    tuneBudsManager.capturePhotoForAi(timeoutMs = 15_000L)
-                } else {
-                    null
-                }
-                if (photoBytes != null && photoBytes.isNotEmpty()) {
-                    val secondResp = sendGeminiWithFallback(
-                        cfg = cfg,
-                        prompt = question,
-                        jpegBytes = photoBytes,
-                        audioBytes = null,
-                        audioMime = null,
-                        allowPhotoTool = false,
-                    )
-                    secondResp.text ?: "Модель вернула пустой текст."
-                } else {
-                    "Не удалось сделать фото с очков."
-                }
+                val finalText = snapAndAskWithPhoto(
+                    question = question,
+                    cfg = cfg,
+                    tuneBudsManager = tuneBudsManager,
+                )
+                deliverReply(finalText, cfg)
             } else {
                 appendMessage(isUser = true, text = "[Голосовой запрос с очков]", hasPhoto = false)
-                firstResp.text ?: "Модель вернула пустой текст."
-            }
-
-            val cleanReply = cleanForSpeech(finalText)
-            appendMessage(isUser = false, text = cleanReply)
-            _lastTempleLog.value = "Ответ получен"
-            if (cfg.speakResponses) {
-                speak(cleanReply)
+                deliverReply(firstText, cfg)
             }
         } catch (error: Throwable) {
             val errText = "Ошибка Gemini: ${error.message ?: "нет ответа"}"
             Log.e(TAG, errText, error)
             _lastTempleLog.value = errText
             appendMessage(isUser = false, text = errText)
-        } finally {
-            _isBusy.value = false
+            if (cfg.speakResponses) speak("Не удалось связаться с ассистентом.")
         }
+    }
+
+    private suspend fun snapAndAskWithPhoto(
+        question: String,
+        cfg: GeminiConfig,
+        tuneBudsManager: TuneBudsManager,
+    ): String {
+        _lastTempleLog.value = "Делаю фото с очков..."
+        val photoRes = tuneBudsManager.capturePhotoForAi()
+        val photoBytes = photoRes.getOrElse { err ->
+            return err.message ?: "Не удалось получить фото с очков."
+        }
+        _lastTempleLog.value = "Анализирую фото..."
+        return sendGeminiWithFallback(
+            cfg = cfg,
+            prompt = question,
+            jpegBytes = photoBytes,
+            audioBytes = null,
+            audioMime = null,
+        )
+    }
+
+    private fun extractNeedPhotoQuestion(rawText: String): String? {
+        val trimmed = rawText.trim()
+        val idx = trimmed.indexOf(NEED_PHOTO_PREFIX, ignoreCase = true)
+        if (idx < 0) return null
+        return trimmed.substring(idx + NEED_PHOTO_PREFIX.length)
+            .lineSequence()
+            .firstOrNull()
+            ?.trim()
+            .orEmpty()
+    }
+
+    private fun deliverReply(rawReply: String, cfg: GeminiConfig): String {
+        val cleanReply = cleanForSpeech(rawReply)
+        appendMessage(isUser = false, text = cleanReply)
+        _lastTempleLog.value = "Ответ получен"
+        if (cfg.speakResponses) {
+            speak(cleanReply)
+        }
+        return cleanReply
     }
 
     private suspend fun sendGeminiWithFallback(
@@ -697,8 +764,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         jpegBytes: ByteArray?,
         audioBytes: ByteArray?,
         audioMime: String?,
-        allowPhotoTool: Boolean,
-    ): GeminiRawResponse {
+    ): String {
         val modelsToTry = (listOf(cfg.model) + FALLBACK_MODELS).distinct()
         var lastError: Throwable? = null
 
@@ -712,15 +778,26 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                         jpegBytes = jpegBytes,
                         audioBytes = audioBytes,
                         audioMime = audioMime,
-                        allowPhotoTool = allowPhotoTool,
+                        enableGoogleSearch = true,
                     )
                 } catch (err: Throwable) {
-                    lastError = err
                     val msg = err.message.orEmpty()
+                    // Если прокси/модель не принимает google_search (HTTP 400) — пробуем без поиска
+                    if (msg.contains("HTTP 400")) {
+                        return sendGeminiRequest(
+                            cfg = cfg.copy(model = modelName),
+                            prompt = prompt,
+                            jpegBytes = jpegBytes,
+                            audioBytes = audioBytes,
+                            audioMime = audioMime,
+                            enableGoogleSearch = false,
+                        )
+                    }
+                    lastError = err
                     val isTransient = msg.contains("HTTP 503") || msg.contains("HTTP 429") || msg.contains("HTTP 500")
                     if (!isTransient) throw err
                     Log.w(TAG, "Model $modelName transient error (attempt ${attempt + 1}): $msg")
-                    delay(1_000L)
+                    delay(900L)
                 }
             }
         }
@@ -733,8 +810,8 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         jpegBytes: ByteArray?,
         audioBytes: ByteArray?,
         audioMime: String?,
-        allowPhotoTool: Boolean,
-    ): GeminiRawResponse = withContext(Dispatchers.IO) {
+        enableGoogleSearch: Boolean,
+    ): String = withContext(Dispatchers.IO) {
         val url = "${cfg.baseUrl}/v1beta/models/${cfg.model}:generateContent?key=${cfg.apiKey}"
 
         val systemInstruction = JSONObject().put(
@@ -770,37 +847,8 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             .put("system_instruction", systemInstruction)
             .put("contents", JSONArray().put(JSONObject().put("parts", parts)))
 
-        if (allowPhotoTool) {
-            val photoTool = JSONObject()
-                .put("name", TOOL_CAPTURE_PHOTO)
-                .put(
-                    "description",
-                    "Сделать снимок с камеры умных очков. Вызывай ТОЛЬКО если пользователь просит посмотреть, описать, прочитать, перевести или распознать что-то перед глазами (например: посмотри, глянь, что это, прочитай, переведи).",
-                )
-                .put(
-                    "parameters",
-                    JSONObject()
-                        .put("type", "OBJECT")
-                        .put(
-                            "properties",
-                            JSONObject().put(
-                                "user_question",
-                                JSONObject()
-                                    .put("type", "STRING")
-                                    .put("description", "Краткий вопрос пользователя на русском языке"),
-                            ),
-                        )
-                        .put("required", JSONArray().put("user_question")),
-                )
-            bodyObj.put(
-                "tools",
-                JSONArray().put(
-                    JSONObject().put(
-                        "function_declarations",
-                        JSONArray().put(photoTool),
-                    ),
-                ),
-            )
+        if (enableGoogleSearch) {
+            bodyObj.put("tools", JSONArray().put(JSONObject().put("google_search", JSONObject())))
         }
 
         val request = Request.Builder()
@@ -820,28 +868,14 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 .optJSONObject(0)
                 ?.optJSONObject("content")
                 ?.optJSONArray("parts")
-                ?: return@withContext GeminiRawResponse(text = null, photoToolQuestion = null)
+                ?: return@withContext "Модель вернула пустой текст."
 
-            var photoQuestion: String? = null
             val textParts = ArrayList<String>()
-
             for (i in 0 until respParts.length()) {
-                val part = respParts.optJSONObject(i) ?: continue
-                val fnCall = part.optJSONObject("functionCall") ?: part.optJSONObject("function_call")
-                if (fnCall != null && fnCall.optString("name") == TOOL_CAPTURE_PHOTO) {
-                    val args = fnCall.optJSONObject("args")
-                    photoQuestion = args?.optString("user_question")?.trim().orEmpty()
-                }
-                val t = part.optString("text").trim()
-                if (t.isNotEmpty()) {
-                    textParts += t
-                }
+                val t = respParts.optJSONObject(i)?.optString("text")?.trim().orEmpty()
+                if (t.isNotEmpty()) textParts += t
             }
-
-            GeminiRawResponse(
-                text = textParts.joinToString(" ").ifBlank { null },
-                photoToolQuestion = photoQuestion,
-            )
+            textParts.joinToString(" ").ifBlank { "Модель вернула пустой текст." }
         }
     }
 
@@ -870,9 +904,49 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
     )
 }
 
-/**
- * Стандартный упаковщик сырых 20ms OPUS-кадров (0xB2) в контейнер Ogg Opus (RFC 7845 + RFC 3533).
- */
+/** Упаковщик 16-битного моно PCM в стандартный WAV (audio/wav). */
+private object WavEncoder {
+    fun encode(pcm: ByteArray, sampleRate: Int, channels: Int = 1, bitsPerSample: Int = 16): ByteArray {
+        val byteRate = sampleRate * channels * bitsPerSample / 8
+        val blockAlign = channels * bitsPerSample / 8
+        val out = ByteArray(44 + pcm.size)
+
+        // RIFF header
+        out[0] = 'R'.code.toByte(); out[1] = 'I'.code.toByte(); out[2] = 'F'.code.toByte(); out[3] = 'F'.code.toByte()
+        putIntLe(out, 4, 36 + pcm.size)
+        out[8] = 'W'.code.toByte(); out[9] = 'A'.code.toByte(); out[10] = 'V'.code.toByte(); out[11] = 'E'.code.toByte()
+
+        // fmt chunk
+        out[12] = 'f'.code.toByte(); out[13] = 'm'.code.toByte(); out[14] = 't'.code.toByte(); out[15] = ' '.code.toByte()
+        putIntLe(out, 16, 16)
+        putShortLe(out, 20, 1) // PCM
+        putShortLe(out, 22, channels)
+        putIntLe(out, 24, sampleRate)
+        putIntLe(out, 28, byteRate)
+        putShortLe(out, 32, blockAlign)
+        putShortLe(out, 34, bitsPerSample)
+
+        // data chunk
+        out[36] = 'd'.code.toByte(); out[37] = 'a'.code.toByte(); out[38] = 't'.code.toByte(); out[39] = 'a'.code.toByte()
+        putIntLe(out, 40, pcm.size)
+        System.arraycopy(pcm, 0, out, 44, pcm.size)
+        return out
+    }
+
+    private fun putShortLe(buf: ByteArray, offset: Int, v: Int) {
+        buf[offset] = (v and 0xFF).toByte()
+        buf[offset + 1] = ((v ushr 8) and 0xFF).toByte()
+    }
+
+    private fun putIntLe(buf: ByteArray, offset: Int, v: Int) {
+        buf[offset] = (v and 0xFF).toByte()
+        buf[offset + 1] = ((v ushr 8) and 0xFF).toByte()
+        buf[offset + 2] = ((v ushr 16) and 0xFF).toByte()
+        buf[offset + 3] = ((v ushr 24) and 0xFF).toByte()
+    }
+}
+
+/** Упаковщик сырых 20ms OPUS-кадров (0xB2) в контейнер Ogg Opus (RFC 7845 + RFC 3533). */
 private object OggOpusMuxer {
     private const val STREAM_SERIAL = 0x54425544
     private const val SAMPLES_PER_20MS_48K = 960L
