@@ -76,6 +76,9 @@ class TuneBudsManager private constructor(context: Context) {
     companion object {
         private const val TAG = "TuneBudsManager"
         private const val REQUEST_TIMEOUT_MS = 10_000L
+        private const val CONFIG_REQUEST_TIMEOUT_MS = 3_500L
+        private const val CONFIG_RETRY_DELAY_MS = 550L
+        private const val VIDEO_LIMIT_MAX_ATTEMPTS = 3
         private const val OPTIONAL_ACK_TIMEOUT_MS = 1_000L
         private const val CAMERA_CLOSE_RETRY_MS = 1_000L
         private const val CAMERA_CLOSE_MAX_ATTEMPTS = 15
@@ -94,6 +97,7 @@ class TuneBudsManager private constructor(context: Context) {
     private val appContext = context.applicationContext
     private val client = TuneBudsSppClient(appContext)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val operationMutex = Mutex()
     private val requestMutex = Mutex()
     private val aiPictureBuffer = ByteArrayOutputStream()
     private val _state = MutableStateFlow(TuneBudsState())
@@ -131,7 +135,6 @@ class TuneBudsManager private constructor(context: Context) {
                     AiBudsForegroundService.stop(appContext)
                 }
 
-                // При отключении полностью очищаем устаревшие заряд, память и счётчики медиа
                 _state.value = if (disconnected) {
                     TuneBudsState(
                         connectionLabel = label,
@@ -204,87 +207,147 @@ class TuneBudsManager private constructor(context: Context) {
     fun isConnected(): Boolean = client.isConnected()
 
     fun takePhoto() = launchCommand("сделать фото") {
-        requireSuccess(request(TuneBudsProtocol.CMD_CAMERA_ON, byteArrayOf(0)))
+        operationMutex.withLock {
+            requireSuccess(request(TuneBudsProtocol.CMD_CAMERA_ON, byteArrayOf(0)))
+        }
     }
 
     suspend fun takePhotoBlocking() {
-        requireSuccess(request(TuneBudsProtocol.CMD_CAMERA_ON, byteArrayOf(0)))
-        delay(2_500L)
-        stopCameraSubsystem()
+        operationMutex.withLock {
+            requireSuccess(request(TuneBudsProtocol.CMD_CAMERA_ON, byteArrayOf(0)))
+            delay(2_500L)
+            stopCameraSubsystem()
+        }
     }
 
     /** Делает ИИ-снимок с очков. При неудаче пишет точную причину в state.value.lastError и возвращает null. */
-    suspend fun capturePhotoForAi(timeoutMs: Long = 15_000L): ByteArray? = coroutineScope {
-        if (!client.isConnected()) {
-            updateError("Очки не подключены")
-            return@coroutineScope null
-        }
-        synchronized(aiPictureBuffer) { aiPictureBuffer.reset() }
-        val photoDeferred = async(start = CoroutineStart.UNDISPATCHED) { aiPhotos.first() }
-        try {
-            val resp = request(TuneBudsProtocol.CMD_CAMERA_ON, byteArrayOf(1))
-            val status = TuneBudsProtocol.parseStatus(resp.payload)
-            if (status != 0) {
-                val hint = if ((_state.value.batteryPercent ?: 100) < 30) {
-                    " (возможно, низкий заряд очков)"
-                } else {
-                    ""
-                }
-                updateError("Очки не смогли сделать фото: код ${status ?: "?"}$hint")
+    suspend fun capturePhotoForAi(timeoutMs: Long = 15_000L): ByteArray? = operationMutex.withLock {
+        coroutineScope {
+            if (!client.isConnected()) {
+                updateError("Очки не подключены")
                 return@coroutineScope null
             }
-            val bytes = withTimeoutOrNull(timeoutMs) { photoDeferred.await() }
-            if (bytes != null && bytes.isNotEmpty()) {
-                _state.value = _state.value.copy(lastError = null)
-                bytes
-            } else {
-                updateError("Таймаут получения фото с очков")
+            synchronized(aiPictureBuffer) { aiPictureBuffer.reset() }
+            val photoDeferred = async(start = CoroutineStart.UNDISPATCHED) { aiPhotos.first() }
+            try {
+                val resp = request(TuneBudsProtocol.CMD_CAMERA_ON, byteArrayOf(1))
+                val status = TuneBudsProtocol.parseStatus(resp.payload)
+                if (status != 0) {
+                    val hint = if ((_state.value.batteryPercent ?: 100) < 30) {
+                        " (возможно, низкий заряд очков)"
+                    } else {
+                        ""
+                    }
+                    updateError("Очки не смогли сделать фото: код ${status ?: "?"}$hint")
+                    return@coroutineScope null
+                }
+                val bytes = withTimeoutOrNull(timeoutMs) { photoDeferred.await() }
+                if (bytes != null && bytes.isNotEmpty()) {
+                    _state.value = _state.value.copy(lastError = null)
+                    bytes
+                } else {
+                    updateError("Таймаут получения фото с очков")
+                    null
+                }
+            } catch (err: Throwable) {
+                updateError("Ошибка фото с очков: ${err.message ?: "нет ответа"}")
                 null
+            } finally {
+                photoDeferred.cancel()
             }
-        } catch (err: Throwable) {
-            updateError("Ошибка фото с очков: ${err.message ?: "нет ответа"}")
-            null
-        } finally {
-            photoDeferred.cancel()
         }
     }
 
     fun toggleVideo() = launchCommand("переключить запись видео") {
-        if (_state.value.isVideoRecording) {
-            stopCameraSubsystem()
-        } else {
-            requireSuccess(request(TuneBudsProtocol.CMD_START_VIDEO))
-            _state.value = _state.value.copy(
-                isVideoRecording = true,
-                videoRecordingStartedAtMs = System.currentTimeMillis(),
-                isAudioRecording = false,
-            )
+        operationMutex.withLock {
+            if (_state.value.isVideoRecording) {
+                stopCameraSubsystem()
+            } else {
+                requireSuccess(request(TuneBudsProtocol.CMD_START_VIDEO))
+                _state.value = _state.value.copy(
+                    isVideoRecording = true,
+                    videoRecordingStartedAtMs = System.currentTimeMillis(),
+                    isAudioRecording = false,
+                )
+            }
         }
     }
 
     fun stopVideo() = launchCommand("остановить видео") {
-        stopCameraSubsystem()
+        operationMutex.withLock {
+            stopCameraSubsystem()
+        }
     }
 
     fun setVideoLimit(seconds: Int) = launchCommand("изменить лимит видео") {
-        val payload = TuneBudsProtocol.buildVideoLimitPayload(seconds)
-        val resp = request(TuneBudsProtocol.CMD_GLASS_CONFIG, payload)
-        val tlv = TuneBudsProtocol.parseTlvResponse(resp.payload)
-        if (tlv[TuneBudsProtocol.CONFIG_VIDEO_LIMIT_TIME] == false) {
-            throw IOException("Очки отклонили лимит видео")
+        if (_state.value.isVideoRecording) {
+            throw IOException("Сначала останови запись видео")
         }
-        _state.value = _state.value.copy(videoLimitSeconds = seconds, lastError = null)
-        runCatching { requestDeviceInfo(TuneBudsProtocol.INFO_VIDEO_LIMIT) }
+        operationMutex.withLock {
+            val payload = TuneBudsProtocol.buildVideoLimitPayload(seconds)
+            var lastErr: Throwable? = null
+            repeat(VIDEO_LIMIT_MAX_ATTEMPTS) { attempt ->
+                try {
+                    val resp = request(
+                        command = TuneBudsProtocol.CMD_GLASS_CONFIG,
+                        payload = payload,
+                        timeoutMs = CONFIG_REQUEST_TIMEOUT_MS,
+                    )
+                    val tlv = TuneBudsProtocol.parseTlvResponse(resp.payload)
+                    val rejected = when {
+                        tlv.containsKey(TuneBudsProtocol.CONFIG_VIDEO_LIMIT_TIME) ->
+                            tlv[TuneBudsProtocol.CONFIG_VIDEO_LIMIT_TIME] == false
+                        resp.payload.size == 1 ->
+                            (resp.payload[0].toInt() and 0xFF) != 0
+                        else -> false
+                    }
+                    if (rejected) {
+                        throw IOException("Очки отклонили лимит видео (сопроцессор занят)")
+                    }
+                    _state.value = _state.value.copy(videoLimitSeconds = seconds, lastError = null)
+                    delay(250L)
+                    runCatching {
+                        requestDeviceInfo(
+                            TuneBudsProtocol.INFO_VIDEO_LIMIT,
+                            timeoutMs = CONFIG_REQUEST_TIMEOUT_MS,
+                        )
+                    }
+                    return@withLock
+                } catch (err: Throwable) {
+                    lastErr = err
+                    if (!client.isConnected() || attempt == VIDEO_LIMIT_MAX_ATTEMPTS - 1) {
+                        throw err
+                    }
+                    Log.w(TAG, "setVideoLimit attempt ${attempt + 1} failed (${err.message}), retrying...")
+                    delay(CONFIG_RETRY_DELAY_MS)
+                }
+            }
+            throw lastErr ?: IOException("Очки не приняли новый лимит видео")
+        }
     }
 
     fun setWearDetection(enabled: Boolean) = launchCommand("переключить датчик снятия") {
-        requireSuccess(
-            request(
-                TuneBudsProtocol.CMD_SET_DETECTION,
-                byteArrayOf(if (enabled) 1 else 0),
-            ),
-        )
-        _state.value = _state.value.copy(inEarDetectionEnabled = enabled, lastError = null)
+        operationMutex.withLock {
+            var lastErr: Throwable? = null
+            repeat(2) { attempt ->
+                try {
+                    requireSuccess(
+                        request(
+                            command = TuneBudsProtocol.CMD_SET_DETECTION,
+                            payload = byteArrayOf(if (enabled) 1 else 0),
+                            timeoutMs = CONFIG_REQUEST_TIMEOUT_MS,
+                        ),
+                    )
+                    _state.value = _state.value.copy(inEarDetectionEnabled = enabled, lastError = null)
+                    return@withLock
+                } catch (err: Throwable) {
+                    lastErr = err
+                    if (!client.isConnected() || attempt == 1) throw err
+                    delay(CONFIG_RETRY_DELAY_MS)
+                }
+            }
+            throw lastErr ?: IOException("Очки не ответили на смену датчика")
+        }
     }
 
     /** Отправляет AIChatStateRequest (0xB0): 1 = SCO, 2 = OPUS, 0 = закрыть. */
@@ -301,79 +364,113 @@ class TuneBudsManager private constructor(context: Context) {
     }
 
     fun toggleAudio() = launchCommand("переключить аудиозапись") {
-        if (_state.value.isAudioRecording) {
-            stopCameraSubsystem()
-        } else {
-            requireSuccess(request(TuneBudsProtocol.CMD_START_AUDIO))
-            _state.value = _state.value.copy(
-                isAudioRecording = true,
-                isVideoRecording = false,
-                videoRecordingStartedAtMs = null,
-            )
+        operationMutex.withLock {
+            if (_state.value.isAudioRecording) {
+                stopCameraSubsystem()
+            } else {
+                requireSuccess(request(TuneBudsProtocol.CMD_START_AUDIO))
+                _state.value = _state.value.copy(
+                    isAudioRecording = true,
+                    isVideoRecording = false,
+                    videoRecordingStartedAtMs = null,
+                )
+            }
         }
     }
 
     fun requestBattery() = launchCommand("прочитать заряд") {
-        requestDeviceInfo(TuneBudsProtocol.INFO_BATTERY)
+        operationMutex.withLock {
+            requestDeviceInfo(TuneBudsProtocol.INFO_BATTERY)
+        }
+    }
+
+    /** Лёгкий фоновый опрос заряда: не будит сопроцессор камеры и уступает любым пользовательским командам. */
+    fun pollBattery() {
+        scope.launch {
+            if (!client.isConnected()) return@launch
+            if (!operationMutex.tryLock()) return@launch
+            try {
+                requestDeviceInfo(TuneBudsProtocol.INFO_BATTERY, timeoutMs = CONFIG_REQUEST_TIMEOUT_MS)
+            } catch (err: Throwable) {
+                Log.d(TAG, "pollBattery skipped: ${err.message}")
+            } finally {
+                operationMutex.unlock()
+            }
+        }
     }
 
     fun requestVersion() = launchCommand("прочитать версии") {
-        requestDeviceInfo(
-            TuneBudsProtocol.INFO_FIRMWARE_VERSION,
-            TuneBudsProtocol.INFO_MODEL,
-            TuneBudsProtocol.INFO_SERIAL_NUMBER,
-        )
-        requireSuccess(request(TuneBudsProtocol.CMD_COPROCESSOR_VERSION))
-        runCatching { requestCapabilityInfo() }
+        operationMutex.withLock {
+            requestDeviceInfo(
+                TuneBudsProtocol.INFO_FIRMWARE_VERSION,
+                TuneBudsProtocol.INFO_MODEL,
+                TuneBudsProtocol.INFO_SERIAL_NUMBER,
+            )
+            requireSuccess(request(TuneBudsProtocol.CMD_COPROCESSOR_VERSION))
+            runCatching { requestCapabilityInfo() }
+        }
     }
 
     fun requestCapabilities() = launchCommand("прочитать возможности") {
-        requestCapabilityInfo()
+        operationMutex.withLock {
+            requestCapabilityInfo()
+        }
     }
 
     fun requestStorage() = launchCommand("прочитать память") {
-        requireSuccess(request(TuneBudsProtocol.CMD_STORAGE))
+        operationMutex.withLock {
+            requireSuccess(request(TuneBudsProtocol.CMD_STORAGE))
+        }
     }
 
     fun formatStorage() = launchCommand("очистить память") {
-        requireSuccess(request(TuneBudsProtocol.CMD_FORMAT_STORAGE))
-        runCatching {
-            request(TuneBudsProtocol.CMD_STORAGE)
-            request(TuneBudsProtocol.CMD_MEDIA_COUNTS)
+        operationMutex.withLock {
+            requireSuccess(request(TuneBudsProtocol.CMD_FORMAT_STORAGE))
+            runCatching {
+                request(TuneBudsProtocol.CMD_STORAGE)
+                request(TuneBudsProtocol.CMD_MEDIA_COUNTS)
+            }
         }
     }
 
     fun requestMediaCount() = launchCommand("прочитать счётчик медиа") {
-        requireSuccess(request(TuneBudsProtocol.CMD_MEDIA_COUNTS))
+        operationMutex.withLock {
+            requireSuccess(request(TuneBudsProtocol.CMD_MEDIA_COUNTS))
+        }
     }
 
     fun requestWorkState() = launchCommand("прочитать состояние") {
-        val response = request(TuneBudsProtocol.CMD_WORK_STATE)
-        TuneBudsProtocol.parseStatus(response.payload)?.let(::applyWorkState)
+        operationMutex.withLock {
+            val response = request(TuneBudsProtocol.CMD_WORK_STATE)
+            TuneBudsProtocol.parseStatus(response.payload)?.let(::applyWorkState)
+        }
     }
 
     fun syncTime() = launchCommand("синхронизировать время") {
-        requireSuccess(
-            request(
-                TuneBudsProtocol.CMD_SET_TIME,
-                TuneBudsProtocol.buildSetTimePayload(),
-            ),
-        )
+        operationMutex.withLock {
+            requireSuccess(
+                request(
+                    TuneBudsProtocol.CMD_SET_TIME,
+                    TuneBudsProtocol.buildSetTimePayload(),
+                ),
+            )
+        }
     }
 
+    /** Обновляет только динамические данные (заряд, датчик, лимит, память, медиа), не дёргая лишний раз статику. */
     fun refreshStatus() = launchCommand("обновить статус") {
-        requestDeviceInfo(
-            TuneBudsProtocol.INFO_BATTERY,
-            TuneBudsProtocol.INFO_FIRMWARE_VERSION,
-            TuneBudsProtocol.INFO_MODEL,
-            TuneBudsProtocol.INFO_SERIAL_NUMBER,
-            TuneBudsProtocol.INFO_IN_EAR_STATE,
-            TuneBudsProtocol.INFO_WIFI_SUPPORT,
-        )
-        requestCapabilityInfo()
-        requireSuccess(request(TuneBudsProtocol.CMD_STORAGE))
-        requireSuccess(request(TuneBudsProtocol.CMD_MEDIA_COUNTS))
-        requireSuccess(request(TuneBudsProtocol.CMD_COPROCESSOR_VERSION))
+        if (!operationMutex.tryLock()) return@launchCommand
+        try {
+            requestDeviceInfo(
+                TuneBudsProtocol.INFO_BATTERY,
+                TuneBudsProtocol.INFO_IN_EAR_STATE,
+                TuneBudsProtocol.INFO_VIDEO_LIMIT,
+            )
+            requireSuccess(request(TuneBudsProtocol.CMD_STORAGE))
+            requireSuccess(request(TuneBudsProtocol.CMD_MEDIA_COUNTS))
+        } finally {
+            operationMutex.unlock()
+        }
     }
 
     suspend fun startFileManager(
@@ -381,60 +478,66 @@ class TuneBudsManager private constructor(context: Context) {
         hotspotPassword: String,
         channel: Int = 0,
         timeoutMs: Long = 30_000L,
-    ): String? = coroutineScope {
-        if (!client.isConnected()) return@coroutineScope null
-        _state.value = _state.value.copy(mediaBaseUrl = null, wifiState = null)
-        val wifiFailure = launch(start = CoroutineStart.UNDISPATCHED) {
-            val failed = state.first { it.wifiState in setOf(0, 4, 5) }
-            throw IOException("Ошибка Wi-Fi на очках (код ${failed.wifiState})")
-        }
-        val endpoint = async(start = CoroutineStart.UNDISPATCHED) {
-            state.filter { !it.mediaBaseUrl.isNullOrBlank() }.first().mediaBaseUrl
-        }
-        try {
-            requireSuccess(
-                request(
-                    TuneBudsProtocol.CMD_CONFIGURE_WIFI,
-                    TuneBudsProtocol.buildWifiPayload(
-                        mode = 0,
-                        ssid = hotspotSsid,
-                        password = hotspotPassword,
-                        channel = channel,
-                    ),
-                ),
-            )
-            var fileManagerAttempt = 1
-            while (true) {
-                val response = request(TuneBudsProtocol.CMD_FILE_MANAGER)
-                when (val status = TuneBudsProtocol.parseStatus(response.payload)) {
-                    0 -> break
-                    1, 3, 5 -> {
-                        if (fileManagerAttempt >= FILE_MANAGER_MAX_ATTEMPTS) {
-                            throw IOException("Файловый сервер очков занят более ${FILE_MANAGER_MAX_ATTEMPTS}с")
-                        }
-                        fileManagerAttempt++
-                        delay(FILE_MANAGER_RETRY_MS)
-                    }
-                    null -> throw IOException("Файловый сервер очков не ответил")
-                    else -> throw IOException("Ошибка файлового сервера очков (код $status)")
-                }
+    ): String? = operationMutex.withLock {
+        coroutineScope {
+            if (!client.isConnected()) return@coroutineScope null
+            _state.value = _state.value.copy(mediaBaseUrl = null, wifiState = null)
+            val wifiFailure = launch(start = CoroutineStart.UNDISPATCHED) {
+                val failed = state.first { it.wifiState in setOf(0, 4, 5) }
+                throw IOException("Ошибка Wi-Fi на очках (код ${failed.wifiState})")
             }
-            withTimeoutOrNull(timeoutMs) { endpoint.await() }
-        } finally {
-            wifiFailure.cancel()
-            endpoint.cancel()
+            val endpoint = async(start = CoroutineStart.UNDISPATCHED) {
+                state.filter { !it.mediaBaseUrl.isNullOrBlank() }.first().mediaBaseUrl
+            }
+            try {
+                requireSuccess(
+                    request(
+                        TuneBudsProtocol.CMD_CONFIGURE_WIFI,
+                        TuneBudsProtocol.buildWifiPayload(
+                            mode = 0,
+                            ssid = hotspotSsid,
+                            password = hotspotPassword,
+                            channel = channel,
+                        ),
+                    ),
+                )
+                var fileManagerAttempt = 1
+                while (true) {
+                    val response = request(TuneBudsProtocol.CMD_FILE_MANAGER)
+                    when (val status = TuneBudsProtocol.parseStatus(response.payload)) {
+                        0 -> break
+                        1, 3, 5 -> {
+                            if (fileManagerAttempt >= FILE_MANAGER_MAX_ATTEMPTS) {
+                                throw IOException("Файловый сервер очков занят более ${FILE_MANAGER_MAX_ATTEMPTS}с")
+                            }
+                            fileManagerAttempt++
+                            delay(FILE_MANAGER_RETRY_MS)
+                        }
+                        null -> throw IOException("Файловый сервер очков не ответил")
+                        else -> throw IOException("Ошибка файлового сервера очков (код $status)")
+                    }
+                }
+                withTimeoutOrNull(timeoutMs) { endpoint.await() }
+            } finally {
+                wifiFailure.cancel()
+                endpoint.cancel()
+            }
         }
     }
 
     fun finishTransfer() = launchCommand("закрыть камеру") {
-        stopCameraSubsystem()
+        operationMutex.withLock {
+            stopCameraSubsystem()
+        }
     }
 
     suspend fun finishTransferBlocking() {
-        stopCameraSubsystem()
+        operationMutex.withLock {
+            stopCameraSubsystem()
+        }
     }
 
-    private suspend fun initializeProtocol() {
+    private suspend fun initializeProtocol() = operationMutex.withLock {
         val capabilities = requestDeviceInfo(
             TuneBudsProtocol.INFO_MAX_PACKET_SIZE,
             TuneBudsProtocol.INFO_AI_KIT_SUPPORT,
@@ -502,10 +605,14 @@ class TuneBudsManager private constructor(context: Context) {
         }
     }
 
-    private suspend fun requestDeviceInfo(vararg types: Int): Map<Int, ByteArray> {
+    private suspend fun requestDeviceInfo(
+        vararg types: Int,
+        timeoutMs: Long = REQUEST_TIMEOUT_MS,
+    ): Map<Int, ByteArray> {
         val response = request(
-            TuneBudsProtocol.CMD_DEVICE_INFO,
-            TuneBudsProtocol.deviceInfoQuery(*types),
+            command = TuneBudsProtocol.CMD_DEVICE_INFO,
+            payload = TuneBudsProtocol.deviceInfoQuery(*types),
+            timeoutMs = timeoutMs,
         )
         return TuneBudsProtocol.parseDeviceInfo(response.payload).also(::applyDeviceInfo)
     }
@@ -513,10 +620,11 @@ class TuneBudsManager private constructor(context: Context) {
     private suspend fun request(
         command: Int,
         payload: ByteArray = byteArrayOf(),
+        timeoutMs: Long = REQUEST_TIMEOUT_MS,
     ): TuneBudsFrame = requestMutex.withLock {
         coroutineScope {
             val response = async(start = CoroutineStart.UNDISPATCHED) {
-                withTimeout(REQUEST_TIMEOUT_MS) {
+                withTimeout(timeoutMs) {
                     client.frames
                         .filter { it.type == TuneBudsFrameType.RESPONSE && it.command == command }
                         .first()
