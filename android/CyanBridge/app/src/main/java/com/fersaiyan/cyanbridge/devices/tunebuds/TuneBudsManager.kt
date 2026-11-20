@@ -195,7 +195,11 @@ class TuneBudsManager private constructor(context: Context) {
         stopCameraSubsystem()
     }
 
-    suspend fun capturePhotoForAi(timeoutMs: Long = 15_000L): Result<ByteArray> = coroutineScope {
+    /** Совместимая обёртка для MainActivity и GeminiLiveGlassesImageCapture. */
+    suspend fun capturePhotoForAi(timeoutMs: Long = 15_000L): ByteArray? =
+        capturePhotoForAiResult(timeoutMs).getOrNull()
+
+    suspend fun capturePhotoForAiResult(timeoutMs: Long = 15_000L): Result<ByteArray> = coroutineScope {
         if (!client.isConnected()) {
             return@coroutineScope Result.failure(IOException("Очки не подключены"))
         }
@@ -456,7 +460,6 @@ class TuneBudsManager private constructor(context: Context) {
         )
         runCatching { requestCapabilityInfo() }
 
-        // Сообщаем прошивке очков, что ИИ-сервис авторизован (аналог setAiServiceAuthed в ABMateManager)
         runCatching {
             request(TuneBudsProtocol.CMD_GLASS_CONFIG, TuneBudsProtocol.buildAiServiceAuthPayload())
             Log.i(TAG, "AI service auth state sent to glasses (0xF7 -> 0x8B [1, 1])")
@@ -614,14 +617,12 @@ class TuneBudsManager private constructor(context: Context) {
             TuneBudsProtocol.INFO_IN_EAR_STATE -> TuneBudsProtocol.parseSupportFlag(frame.payload)?.let { enabled ->
                 _state.value = _state.value.copy(inEarDetectionEnabled = enabled, lastError = null)
             }
-            // Событие удержания дужки / AI-чата (0xB0 NOTIFICATION: 1=SCO, 2=OPUS, 0=CLOSE, 255=ERR)
             TuneBudsProtocol.CMD_AI_CHAT_STATE -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
                 val aiState = TuneBudsProtocol.parseStatus(frame.payload) ?: return
                 Log.i(TAG, "Glasses AI Chat state notification: $aiState")
                 _state.value = _state.value.copy(lastAiChatState = aiState)
                 _aiEvents.tryEmit(TuneBudsAiEvent(chatState = aiState))
             }
-            // Поток OPUS с микрофона очков по SPP (0xB2 NOTIFICATION, кадры по 80 байт / 20 мс)
             TuneBudsProtocol.CMD_AI_RECORD_DATA -> if (frame.type == TuneBudsFrameType.NOTIFICATION && frame.payload.isNotEmpty()) {
                 _aiOpusPackets.tryEmit(frame.payload.copyOf())
             }
