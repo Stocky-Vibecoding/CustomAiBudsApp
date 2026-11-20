@@ -110,31 +110,45 @@ class TuneBudsManager private constructor(context: Context) {
     init {
         scope.launch {
             client.state.collect { transportState ->
+                val prev = _state.value
                 val label = when (transportState) {
                     TuneBudsSppState.DISCONNECTED -> "Не подключено"
                     TuneBudsSppState.BONDING -> "Сопряжение..."
                     TuneBudsSppState.CONNECTING -> "Подключение..."
                     TuneBudsSppState.CONNECTED -> "Подключено"
-                    TuneBudsSppState.ERROR -> _state.value.lastError ?: "Ошибка подключения"
+                    TuneBudsSppState.ERROR -> prev.lastError ?: "Ошибка подключения"
                 }
                 val connected = transportState == TuneBudsSppState.CONNECTED
+                val disconnected = transportState == TuneBudsSppState.DISCONNECTED ||
+                    transportState == TuneBudsSppState.ERROR
+
                 if (connected) {
                     AiBudsForegroundService.start(
                         appContext,
-                        _state.value.deviceName ?: _state.value.model,
+                        prev.deviceName ?: prev.model,
                     )
-                } else if (transportState == TuneBudsSppState.DISCONNECTED ||
-                    transportState == TuneBudsSppState.ERROR
-                ) {
+                } else if (disconnected) {
                     AiBudsForegroundService.stop(appContext)
                 }
-                _state.value = _state.value.copy(
-                    connectionLabel = label,
-                    protocolState = transportState.name,
-                    isVideoRecording = if (connected) _state.value.isVideoRecording else false,
-                    videoRecordingStartedAtMs = if (connected) _state.value.videoRecordingStartedAtMs else null,
-                    isAudioRecording = if (connected) _state.value.isAudioRecording else false,
-                )
+
+                // При отключении полностью очищаем устаревшие заряд, память и счётчики медиа
+                _state.value = if (disconnected) {
+                    TuneBudsState(
+                        connectionLabel = label,
+                        protocolState = transportState.name,
+                        deviceAddress = prev.deviceAddress,
+                        deviceName = prev.deviceName,
+                        lastError = if (transportState == TuneBudsSppState.ERROR) prev.lastError else null,
+                    )
+                } else {
+                    prev.copy(
+                        connectionLabel = label,
+                        protocolState = transportState.name,
+                        isVideoRecording = if (connected) prev.isVideoRecording else false,
+                        videoRecordingStartedAtMs = if (connected) prev.videoRecordingStartedAtMs else null,
+                        isAudioRecording = if (connected) prev.isAudioRecording else false,
+                    )
+                }
             }
         }
         scope.launch { client.frames.collect(::handleFrame) }
@@ -179,6 +193,12 @@ class TuneBudsManager private constructor(context: Context) {
         connectJob = null
         AiBudsForegroundService.stop(appContext)
         client.disconnect()
+        _state.value = TuneBudsState(
+            connectionLabel = "Не подключено",
+            protocolState = TuneBudsSppState.DISCONNECTED.name,
+            deviceAddress = _state.value.deviceAddress,
+            deviceName = _state.value.deviceName,
+        )
     }
 
     fun isConnected(): Boolean = client.isConnected()
@@ -580,6 +600,7 @@ class TuneBudsManager private constructor(context: Context) {
     }
 
     private fun handleFrame(frame: TuneBudsFrame) {
+        if (!client.isConnected()) return
         when (frame.command) {
             TuneBudsProtocol.CMD_WIFI_STATE -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
                 TuneBudsProtocol.parseStatus(frame.payload)?.let { value ->
