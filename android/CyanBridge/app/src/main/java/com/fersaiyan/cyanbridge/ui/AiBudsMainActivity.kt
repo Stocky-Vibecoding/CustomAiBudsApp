@@ -241,10 +241,10 @@ private fun AiBudsRootScreen(
     LaunchedEffect(glassState.protocolState) {
         if (glassState.protocolState == "CONNECTED") {
             while (isActive) {
-                delay(15_000L)
+                delay(30_000L)
                 val cur = tuneBuds.state.value
                 if (cur.protocolState == "CONNECTED" && !cur.isVideoRecording && !cur.isAudioRecording) {
-                    tuneBuds.refreshStatus()
+                    tuneBuds.pollBattery()
                 }
             }
         }
