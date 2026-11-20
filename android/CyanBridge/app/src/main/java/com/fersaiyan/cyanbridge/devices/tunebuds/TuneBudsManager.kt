@@ -68,8 +68,6 @@ data class TuneBudsState(
     val workState: Int? = null,
     val isVideoRecording: Boolean = false,
     val isAudioRecording: Boolean = false,
-    val keySettings: Map<Int, Int> = emptyMap(),
-    val gestureStatus: String? = null,
     val lastError: String? = null,
 )
 
@@ -92,12 +90,13 @@ class TuneBudsManager private constructor(context: Context) {
             }
     }
 
-    private val client = TuneBudsSppClient(context.applicationContext)
+    private val appContext = context.applicationContext
+    private val client = TuneBudsSppClient(appContext)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val requestMutex = Mutex()
     private val aiPictureBuffer = ByteArrayOutputStream()
     private val _state = MutableStateFlow(TuneBudsState())
-    private val _aiPhotos = MutableSharedFlow<ByteArray>(extraBufferCapacity = 1)
+    private val _aiPhotos = MutableSharedFlow<ByteArray>(extraBufferCapacity = 2)
     private val _aiEvents = MutableSharedFlow<TuneBudsAiEvent>(extraBufferCapacity = 16)
     private val _aiOpusPackets = MutableSharedFlow<ByteArray>(extraBufferCapacity = 256)
     private var connectJob: Job? = null
@@ -116,6 +115,9 @@ class TuneBudsManager private constructor(context: Context) {
                     TuneBudsSppState.CONNECTING -> "Подключение..."
                     TuneBudsSppState.CONNECTED -> "Подключено"
                     TuneBudsSppState.ERROR -> _state.value.lastError ?: "Ошибка подключения"
+                }
+                if (transportState == TuneBudsSppState.DISCONNECTED || transportState == TuneBudsSppState.ERROR) {
+                    AiBudsGlassService.stop(appContext)
                 }
                 _state.value = _state.value.copy(
                     connectionLabel = label,
@@ -148,6 +150,8 @@ class TuneBudsManager private constructor(context: Context) {
             return
         }
         connectJob?.cancel()
+        // Поднимаем Foreground Service сразу пока приложение на экране (требование Android 14+ для микрофона в фоне)
+        AiBudsGlassService.start(appContext, deviceName)
         _state.value = TuneBudsState(
             connectionLabel = "Подключение...",
             protocolState = TuneBudsSppState.CONNECTING.name,
@@ -156,6 +160,7 @@ class TuneBudsManager private constructor(context: Context) {
         )
         connectJob = scope.launch {
             client.connect(normalizedAddress).getOrElse { error ->
+                AiBudsGlassService.stop(appContext)
                 updateError(error.message ?: "Не удалось подключиться к очкам")
                 return@launch
             }
@@ -172,6 +177,7 @@ class TuneBudsManager private constructor(context: Context) {
     fun disconnect() {
         connectJob?.cancel()
         connectJob = null
+        AiBudsGlassService.stop(appContext)
         client.disconnect()
     }
 
@@ -233,68 +239,6 @@ class TuneBudsManager private constructor(context: Context) {
         _state.value = _state.value.copy(inEarDetectionEnabled = enabled, lastError = null)
     }
 
-    /**
-     * Применяет пресет тачпада строго по протоколу KeyRequest (0x22) + TlvResponsePayloadHandler.
-     * Использует каналы (правый/левый), которые очки сами сообщили в INFO_KEY_SETTINGS (0x05).
-     */
-    fun applyTouchpadPreset(preset: Int) = launchCommand("изменить жесты тачпада") {
-        val existing = _state.value.keySettings
-        val useLeft = existing.keys.any { it in setOf(1, 3, 5) }
-        val useRight = existing.keys.any { it in setOf(2, 4, 6) } || !useLeft
-
-        val targetTaps: List<Pair<Int, Int>> = when (preset) {
-            // 0: Удобный (1× Пауза, 2× След., 3× Пред.)
-            0 -> listOf(
-                1 to TuneBudsProtocol.KEY_FUNC_PLAY_PAUSE,
-                2 to TuneBudsProtocol.KEY_FUNC_NEXT,
-                3 to TuneBudsProtocol.KEY_FUNC_PREV,
-            )
-            // 1: Заводской (1× Выкл, 2× Пауза, 3× След.)
-            else -> listOf(
-                1 to TuneBudsProtocol.KEY_FUNC_NONE,
-                2 to TuneBudsProtocol.KEY_FUNC_PLAY_PAUSE,
-                3 to TuneBudsProtocol.KEY_FUNC_NEXT,
-            )
-        }
-
-        val updatedMap = existing.toMutableMap()
-        var accepted = 0
-        var rejected = 0
-
-        for ((tap, func) in targetTaps) {
-            val keyTypes = buildList {
-                if (useRight) add(tap * 2) // 2, 4, 6
-                if (useLeft) add(tap * 2 - 1) // 1, 3, 5
-            }
-            for (keyType in keyTypes) {
-                val resp = request(TuneBudsProtocol.CMD_KEY, TuneBudsProtocol.buildKeyPayload(keyType, func))
-                val tlv = TuneBudsProtocol.parseTlvResponse(resp.payload)
-                if (tlv[keyType] == true) {
-                    updatedMap[keyType] = func
-                    accepted++
-                } else {
-                    rejected++
-                }
-            }
-        }
-
-        val statusMsg = when {
-            accepted > 0 && rejected == 0 -> "Жесты сохранены в памяти очков"
-            accepted > 0 -> "Сохранено частично ($accepted принято, $rejected отклонено)"
-            else -> "Прошивка этих очков не поддерживает смену жестов"
-        }
-        _state.value = _state.value.copy(
-            keySettings = updatedMap,
-            gestureStatus = statusMsg,
-            lastError = null,
-        )
-        runCatching { requestDeviceInfo(TuneBudsProtocol.INFO_KEY_SETTINGS) }
-    }
-
-    /**
-     * Отправляет AIChatStateRequest (0xB0): 1 = SCO, 2 = OPUS, 0 = закрыть.
-     * Не блокирует очередь на 10с и не бросает ошибку, если прошивка не шлёт RESPONSE на 0xB0.
-     */
     fun setAiChatState(mode: Int) {
         scope.launch {
             if (!client.isConnected()) return@launch
@@ -370,7 +314,6 @@ class TuneBudsManager private constructor(context: Context) {
         requestDeviceInfo(
             TuneBudsProtocol.INFO_BATTERY,
             TuneBudsProtocol.INFO_FIRMWARE_VERSION,
-            TuneBudsProtocol.INFO_KEY_SETTINGS,
             TuneBudsProtocol.INFO_MODEL,
             TuneBudsProtocol.INFO_SERIAL_NUMBER,
             TuneBudsProtocol.INFO_IN_EAR_STATE,
@@ -464,7 +407,6 @@ class TuneBudsManager private constructor(context: Context) {
         requestDeviceInfo(
             TuneBudsProtocol.INFO_BATTERY,
             TuneBudsProtocol.INFO_FIRMWARE_VERSION,
-            TuneBudsProtocol.INFO_KEY_SETTINGS,
             TuneBudsProtocol.INFO_MODEL,
             TuneBudsProtocol.INFO_SERIAL_NUMBER,
             TuneBudsProtocol.INFO_IN_EAR_STATE,
@@ -475,7 +417,6 @@ class TuneBudsManager private constructor(context: Context) {
         )
         runCatching { requestCapabilityInfo() }
 
-        // Сообщаем прошивке очков, что ИИ-сервис авторизован (аналог setAiServiceAuthed в ABMateManager)
         runCatching {
             request(TuneBudsProtocol.CMD_GLASS_CONFIG, TuneBudsProtocol.buildAiServiceAuthPayload())
             Log.i(TAG, "AI service auth state sent to glasses (0xF7 -> 0x8B [1, 1])")
@@ -607,22 +548,15 @@ class TuneBudsManager private constructor(context: Context) {
                     .onFailure { Log.w(TAG, "Invalid device-info response", it) }
             }
             TuneBudsProtocol.INFO_BATTERY -> TuneBudsProtocol.parseBattery(frame.payload)?.let(::applyBattery)
-            TuneBudsProtocol.INFO_KEY_SETTINGS -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
-                val updated = _state.value.keySettings.toMutableMap()
-                updated.putAll(TuneBudsProtocol.parseKeySettings(frame.payload))
-                _state.value = _state.value.copy(keySettings = updated, lastError = null)
-            }
             TuneBudsProtocol.INFO_IN_EAR_STATE -> TuneBudsProtocol.parseSupportFlag(frame.payload)?.let { enabled ->
                 _state.value = _state.value.copy(inEarDetectionEnabled = enabled, lastError = null)
             }
-            // Точное событие удержания дужки / AI чата (0xB0 NOTIFICATION: 1=SCO, 2=OPUS, 0=CLOSE, 255=ERR)
             TuneBudsProtocol.CMD_AI_CHAT_STATE -> if (frame.type == TuneBudsFrameType.NOTIFICATION) {
                 val aiState = TuneBudsProtocol.parseStatus(frame.payload) ?: return
                 Log.i(TAG, "Glasses AI Chat state notification: $aiState")
                 _state.value = _state.value.copy(lastAiChatState = aiState)
                 _aiEvents.tryEmit(TuneBudsAiEvent(chatState = aiState))
             }
-            // Поток OPUS-голоса с микрофона очков по SPP (0xB2 NOTIFICATION, кадры по 80 байт / 20 мс)
             TuneBudsProtocol.CMD_AI_RECORD_DATA -> if (frame.type == TuneBudsFrameType.NOTIFICATION && frame.payload.isNotEmpty()) {
                 _aiOpusPackets.tryEmit(frame.payload.copyOf())
             }
@@ -672,13 +606,6 @@ class TuneBudsManager private constructor(context: Context) {
         }
         info[TuneBudsProtocol.INFO_FIRMWARE_VERSION]?.let { payload ->
             TuneBudsProtocol.parseFirmwareVersion(payload)?.let { current = current.copy(firmwareVersion = it) }
-        }
-        info[TuneBudsProtocol.INFO_KEY_SETTINGS]?.let { payload ->
-            val keys = TuneBudsProtocol.parseKeySettings(payload)
-            if (keys.isNotEmpty()) {
-                val merged = current.keySettings.toMutableMap().apply { putAll(keys) }
-                current = current.copy(keySettings = merged)
-            }
         }
         info[TuneBudsProtocol.INFO_MODEL]?.let { payload ->
             TuneBudsProtocol.parseString(payload)?.let { current = current.copy(model = it) }
