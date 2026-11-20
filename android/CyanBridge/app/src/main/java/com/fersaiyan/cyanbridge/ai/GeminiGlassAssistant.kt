@@ -113,8 +113,8 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 "Во всех остальных случаях сразу дай краткий голосовой ответ на вопрос пользователя."
 
         private val FALLBACK_MODELS = listOf(
-            "gemini-2.5-flash-lite",
-            "gemini-2.0-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.5-flash",
         )
 
         private val VISION_TRIGGERS = listOf(
@@ -722,6 +722,8 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             "Gemini заблокирован по региону. Проверь VPN или прокси."
         error is GeminiApiException && (error.httpCode == 401 || error.httpCode == 403) ->
             "Неверный API-ключ Gemini."
+        error is GeminiApiException && error.httpCode == 404 ->
+            "Модель Gemini устарела или не найдена. Обнови имя модели в настройках."
         error is GeminiApiException && error.httpCode == 429 ->
             "Превышен лимит запросов Gemini, попробуй чуть позже."
         error is GeminiApiException ->
@@ -769,6 +771,10 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 } catch (err: GeminiApiException) {
                     lastError = err
                     if (err.isGeoBlocked) throw err
+                    if (err.httpCode == 404) {
+                        Log.w(TAG, "Model $modelName unavailable (HTTP 404), trying next fallback")
+                        break
+                    }
                     // Если прокси/модель не принимает google_search — пробуем сразу без него
                     if (err.httpCode == 400 && useSearch) {
                         useSearch = false
