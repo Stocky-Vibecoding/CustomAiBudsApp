@@ -16,11 +16,12 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.fersaiyan.cyanbridge.R
+import com.fersaiyan.cyanbridge.ai.IncomingCallAnnouncer
 import com.fersaiyan.cyanbridge.ui.AiBudsMainActivity
 
 /**
- * Держит SPP-соединение с очками и доступ к Bluetooth-микрофону активными,
- * когда приложение свёрнуто или экран телефона заблокирован.
+ * Держит SPP-соединение с очками, озвучку входящих вызовов и доступ к Bluetooth-микрофону
+ * активными, когда приложение свёрнуто или экран телефона заблокирован.
  */
 class AiBudsForegroundService : Service() {
 
@@ -62,6 +63,7 @@ class AiBudsForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            IncomingCallAnnouncer.getInstance(applicationContext).stopListening()
             stopForegroundCompat()
             stopSelf()
             return START_NOT_STICKY
@@ -69,10 +71,12 @@ class AiBudsForegroundService : Service() {
 
         val deviceName = intent?.getStringExtra(EXTRA_DEVICE_NAME)?.takeIf { it.isNotBlank() } ?: "AI Glasses"
         startForegroundSafe(deviceName)
+        IncomingCallAnnouncer.getInstance(applicationContext).startListening()
         return START_STICKY
     }
 
     override fun onDestroy() {
+        IncomingCallAnnouncer.getInstance(applicationContext).stopListening()
         stopForegroundCompat()
         super.onDestroy()
     }
@@ -127,7 +131,7 @@ class AiBudsForegroundService : Service() {
                 "Подключение умных очков",
                 NotificationManager.IMPORTANCE_LOW,
             ).apply {
-                description = "Поддерживает связь с очками и голосовой вызов Gemini при выключенном экране"
+                description = "Поддерживает связь с очками, озвучку звонков и голосовой ИИ при выключенном экране"
                 setShowBadge(false)
             }
             nm.createNotificationChannel(channel)
@@ -148,7 +152,7 @@ class AiBudsForegroundService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_aibuds_launcher)
             .setContentTitle("AiBuds Studio")
-            .setContentText("Очки $deviceName подключены • голосовой ИИ активен")
+            .setContentText("Очки $deviceName подключены • ИИ и звонки активны")
             .setOngoing(true)
             .setSilent(true)
             .setContentIntent(pendingIntent)
