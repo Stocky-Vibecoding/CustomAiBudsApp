@@ -54,7 +54,7 @@ import kotlin.math.sqrt
 data class GeminiConfig(
     val apiKey: String = "",
     val baseUrl: String = "https://generativelanguage.googleapis.com",
-    val model: String = "gemini-2.5-flash",
+    val model: String = "gemini-3-flash-preview",
     val speakResponses: Boolean = true,
 )
 
@@ -95,6 +95,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         private const val KEY_BASE_URL = "base_url"
         private const val KEY_MODEL = "model"
         private const val KEY_SPEAK = "speak_responses"
+        private const val DEFAULT_MODEL = "gemini-3-flash-preview"
 
         private const val SAMPLE_RATE_HZ = 16_000
         private const val SCO_ROUTE_TIMEOUT_MS = 2_800L
@@ -113,8 +114,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             "Ты — голосовой ИИ-ассистент в умных очках. Твои ответы сразу озвучиваются голосом (TTS) прямо в уши. " +
                 "Отвечай максимально кратко, чётко и по делу (1–3 предложения). " +
                 "Никогда не используй Markdown, звёздочки, решётки, тире для списков, эмодзи и технические термины — " +
-                "только чистый живой разговорный текст на русском языке. " +
-                "Если нужно узнать погоду, новости, курсы или актуальные факты — используй поиск Google."
+                "только чистый живой разговорный текст на русском языке."
 
         private const val VISION_ROUTER_INSTRUCTION =
             "Если пользователь просит посмотреть, глянуть, описать, прочитать, перевести, распознать или проверить " +
@@ -169,6 +169,10 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
     val isBusy: StateFlow<Boolean> = _isBusy.asStateFlow()
 
     private val busyGuard = AtomicBoolean(false)
+
+    @Volatile
+    private var searchGroundingDisabled = false
+
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var glassesListenerJob: Job? = null
@@ -198,7 +202,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             baseUrl = newConfig.baseUrl.trim().trimEnd('/').ifBlank {
                 "https://generativelanguage.googleapis.com"
             },
-            model = newConfig.model.trim().removePrefix("models/").ifBlank { "gemini-2.5-flash" },
+            model = newConfig.model.trim().removePrefix("models/").ifBlank { DEFAULT_MODEL },
         )
         prefs.edit()
             .putString(KEY_API, cleaned.apiKey)
@@ -206,6 +210,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             .putString(KEY_MODEL, cleaned.model)
             .putBoolean(KEY_SPEAK, cleaned.speakResponses)
             .apply()
+        searchGroundingDisabled = false
         _config.value = cleaned
     }
 
@@ -763,8 +768,9 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
     }
 
     /**
-     * Шлёт запрос строго в выбранную пользователем модель (без скрытой подмены на мёртвые фоллбэки).
-     * На HTTP 429 не тратит квоту повторными попытками; повторяет только 1 раз при сетевом сбое или 5xx.
+     * Шлёт запрос строго в выбранную пользователем модель.
+     * Если Search Grounding отбивается с 400 или 429 (нулевая квота поиска на Free Tier) —
+     * сразу повторяет чистый запрос без google_search и запоминает это до смены настроек.
      */
     private suspend fun sendGeminiWithRetry(
         cfg: GeminiConfig,
@@ -773,7 +779,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         audioBytes: ByteArray?,
         audioMime: String?,
     ): String {
-        var useSearch = true
+        var useSearch = !searchGroundingDisabled
         var retriesLeft = 1
 
         while (true) {
@@ -788,8 +794,9 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 )
             } catch (err: GeminiApiException) {
                 if (err.isGeoBlocked) throw err
-                // Если модель/прокси не поддерживает google_search — пробуем один раз без него
-                if (err.httpCode == 400 && useSearch) {
+                if ((err.httpCode == 400 || err.httpCode == 429) && useSearch) {
+                    Log.w(TAG, "Disabling google_search after HTTP ${err.httpCode} on ${cfg.model}")
+                    searchGroundingDisabled = true
                     useSearch = false
                     continue
                 }
@@ -881,7 +888,9 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
 
             val textParts = ArrayList<String>()
             for (i in 0 until respParts.length()) {
-                val t = respParts.optJSONObject(i)?.optString("text")?.trim().orEmpty()
+                val partObj = respParts.optJSONObject(i) ?: continue
+                if (partObj.optBoolean("thought", false)) continue
+                val t = partObj.optString("text").trim()
                 if (t.isNotEmpty()) textParts += t
             }
             textParts.joinToString(" ").ifBlank { "Модель вернула пустой текст." }
@@ -908,7 +917,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         baseUrl = prefs.getString(KEY_BASE_URL, "https://generativelanguage.googleapis.com")
             .orEmpty()
             .ifBlank { "https://generativelanguage.googleapis.com" },
-        model = prefs.getString(KEY_MODEL, "gemini-2.5-flash").orEmpty().ifBlank { "gemini-2.5-flash" },
+        model = prefs.getString(KEY_MODEL, DEFAULT_MODEL).orEmpty().ifBlank { DEFAULT_MODEL },
         speakResponses = prefs.getBoolean(KEY_SPEAK, true),
     )
 }
