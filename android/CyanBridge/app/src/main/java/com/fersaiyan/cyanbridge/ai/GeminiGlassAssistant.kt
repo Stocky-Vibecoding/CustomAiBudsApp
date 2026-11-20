@@ -46,6 +46,7 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.nio.charset.StandardCharsets
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
@@ -54,8 +55,9 @@ import kotlin.math.sqrt
 data class GeminiConfig(
     val apiKey: String = "",
     val baseUrl: String = "https://generativelanguage.googleapis.com",
-    val model: String = "gemini-3-flash-preview",
+    val model: String = "gemini-2.5-flash",
     val speakResponses: Boolean = true,
+    val autoSwitchModels: Boolean = true,
 )
 
 data class GeminiChatMessage(
@@ -85,6 +87,13 @@ private class GeminiApiException(
             rawBody.contains("User location is not supported", ignoreCase = true) ||
                 rawBody.contains("FAILED_PRECONDITION", ignoreCase = true)
             )
+
+    val isDailyOrZeroQuota: Boolean
+        get() = httpCode == 429 && (
+            rawBody.contains("PerDay", ignoreCase = true) ||
+                rawBody.contains("RequestsPerDay", ignoreCase = true) ||
+                rawBody.contains("limit: 0", ignoreCase = true)
+            )
 }
 
 class GeminiGlassAssistant private constructor(private val context: Context) {
@@ -95,7 +104,21 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         private const val KEY_BASE_URL = "base_url"
         private const val KEY_MODEL = "model"
         private const val KEY_SPEAK = "speak_responses"
-        private const val DEFAULT_MODEL = "gemini-3-flash-preview"
+        private const val KEY_AUTO_SWITCH = "auto_switch_models"
+        private const val DEFAULT_MODEL = "gemini-2.5-flash"
+
+        // Пул моделей для автопереключения по кругу (в порядке приоритета)
+        private val AUTO_MODEL_POOL = listOf(
+            "gemini-2.5-flash",
+            "gemini-3-flash-preview",
+            "gemini-2.5-flash-lite",
+            "gemini-3.5-flash-lite",
+            "gemini-3.5-flash",
+        )
+
+        private const val COOLDOWN_MINUTE_MS = 65_000L
+        private const val COOLDOWN_DAILY_MS = 60 * 60_000L
+        private const val COOLDOWN_NOT_FOUND_MS = 24 * 60 * 60_000L
 
         private const val SAMPLE_RATE_HZ = 16_000
         private const val SCO_ROUTE_TIMEOUT_MS = 2_800L
@@ -162,6 +185,9 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
     private val _config = MutableStateFlow(loadConfig())
     val config: StateFlow<GeminiConfig> = _config.asStateFlow()
 
+    private val _activeModel = MutableStateFlow(_config.value.model)
+    val activeModel: StateFlow<String> = _activeModel.asStateFlow()
+
     private val _messages = MutableStateFlow<List<GeminiChatMessage>>(emptyList())
     val messages: StateFlow<List<GeminiChatMessage>> = _messages.asStateFlow()
 
@@ -170,8 +196,10 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
 
     private val busyGuard = AtomicBoolean(false)
 
-    @Volatile
-    private var searchGroundingDisabled = false
+    // Таймеры паузы по моделям (модель -> timestamp, когда квота снова проверяется)
+    private val modelCooldowns = ConcurrentHashMap<String, Long>()
+    private val notFoundModels = ConcurrentHashMap<String, Boolean>()
+    private val searchDisabledModels = ConcurrentHashMap<String, Boolean>()
 
     private var tts: TextToSpeech? = null
     private var ttsReady = false
@@ -209,8 +237,14 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             .putString(KEY_BASE_URL, cleaned.baseUrl)
             .putString(KEY_MODEL, cleaned.model)
             .putBoolean(KEY_SPEAK, cleaned.speakResponses)
+            .putBoolean(KEY_AUTO_SWITCH, cleaned.autoSwitchModels)
             .apply()
-        searchGroundingDisabled = false
+
+        // При смене ключа, адреса или режима сбрасываем все накопленные паузы моделей
+        modelCooldowns.clear()
+        notFoundModels.clear()
+        searchDisabledModels.clear()
+        _activeModel.value = cleaned.model
         _config.value = cleaned
     }
 
@@ -618,7 +652,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 null
             }
 
-            val firstText = sendGeminiWithRetry(
+            val firstText = sendGeminiWithAutoSwitch(
                 cfg = cfg,
                 prompt = if (initialPhoto == null && canUseGlasses) {
                     "$VISION_ROUTER_INSTRUCTION\n\nЗапрос пользователя: $prompt"
@@ -670,7 +704,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 "Выслушай голосовой запрос в аудио и сразу дай краткий ответ на русском."
             }
 
-            val firstText = sendGeminiWithRetry(
+            val firstText = sendGeminiWithAutoSwitch(
                 cfg = cfg,
                 prompt = prompt,
                 jpegBytes = null,
@@ -705,7 +739,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
     ): String {
         val photoBytes = tuneBudsManager.capturePhotoForAi()
             ?: return tuneBudsManager.state.value.lastError ?: "Не удалось получить фото с очков."
-        return sendGeminiWithRetry(
+        return sendGeminiWithAutoSwitch(
             cfg = cfg,
             prompt = question,
             jpegBytes = photoBytes,
@@ -735,7 +769,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             error is GeminiApiException && error.httpCode == 404 ->
                 "Модель Gemini не найдена. Проверь название модели в настройках."
             error is GeminiApiException && error.httpCode == 429 ->
-                "Превышен лимит запросов Gemini."
+                "У всех моделей временно кончился лимит, попробуй чуть позже."
             error is GeminiApiException ->
                 "Ошибка сервера Gemini, код ${error.httpCode}."
             error is IOException ->
@@ -768,56 +802,125 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
     }
 
     /**
-     * Шлёт запрос строго в выбранную пользователем модель.
-     * Если Search Grounding отбивается с 400 или 429 (нулевая квота поиска на Free Tier) —
-     * сразу повторяет чистый запрос без google_search и запоминает это до смены настроек.
+     * В авторежиме перебирает приоритетную модель и резервный пул:
+     * - если квота модели вышла (429), ставит её на паузу (65с для RPM, 1ч для RPD) и идёт к следующей;
+     * - как только пауза истекает, автоматически возвращается к приоритетной модели;
+     * - если модель дала 404, убирает её на 24ч, чтобы не тратить время;
+     * - при выключенном автопереключении бьёт строго в выбранную модель.
      */
-    private suspend fun sendGeminiWithRetry(
+    private suspend fun sendGeminiWithAutoSwitch(
         cfg: GeminiConfig,
         prompt: String,
         jpegBytes: ByteArray?,
         audioBytes: ByteArray?,
         audioMime: String?,
     ): String {
-        var useSearch = !searchGroundingDisabled
-        var retriesLeft = 1
+        val fullPool = if (cfg.autoSwitchModels) {
+            (listOf(cfg.model) + AUTO_MODEL_POOL).distinct()
+        } else {
+            listOf(cfg.model)
+        }
 
-        while (true) {
-            try {
-                return sendGeminiRequest(
-                    cfg = cfg,
-                    prompt = prompt,
-                    jpegBytes = jpegBytes,
-                    audioBytes = audioBytes,
-                    audioMime = audioMime,
-                    enableGoogleSearch = useSearch,
-                )
-            } catch (err: GeminiApiException) {
-                if (err.isGeoBlocked) throw err
-                if ((err.httpCode == 400 || err.httpCode == 429) && useSearch) {
-                    Log.w(TAG, "Disabling google_search after HTTP ${err.httpCode} on ${cfg.model}")
-                    searchGroundingDisabled = true
-                    useSearch = false
-                    continue
-                }
-                val isServerGlitch = err.httpCode in setOf(500, 502, 503, 504)
-                if (isServerGlitch && retriesLeft > 0) {
-                    retriesLeft--
-                    Log.w(TAG, "Model ${cfg.model} HTTP ${err.httpCode}, retrying once")
-                    delay(900L)
-                    continue
-                }
-                throw err
-            } catch (err: IOException) {
-                if (retriesLeft > 0) {
-                    retriesLeft--
-                    Log.w(TAG, "Model ${cfg.model} network error (${err.message}), retrying once")
-                    delay(700L)
-                    continue
-                }
-                throw err
+        val now = System.currentTimeMillis()
+        val candidates = if (!cfg.autoSwitchModels) {
+            fullPool
+        } else {
+            val ready = fullPool.filter { (modelCooldowns[it] ?: 0L) <= now }
+            if (ready.isNotEmpty()) {
+                ready
+            } else {
+                // Если все модели на паузе — проверяем самую «отдохнувшую» из живых (не 404)
+                val living = fullPool.filter { notFoundModels[it] != true }
+                val source = living.ifEmpty { fullPool }
+                listOf(source.minBy { modelCooldowns[it] ?: 0L })
             }
         }
+
+        var bestError: Throwable? = null
+
+        for (modelName in candidates) {
+            var useSearch = searchDisabledModels[modelName] != true
+            var retriedWithoutSearch = false
+            var serverRetriesLeft = 1
+
+            while (true) {
+                try {
+                    val reply = sendGeminiRequest(
+                        cfg = cfg.copy(model = modelName),
+                        prompt = prompt,
+                        jpegBytes = jpegBytes,
+                        audioBytes = audioBytes,
+                        audioMime = audioMime,
+                        enableGoogleSearch = useSearch,
+                    )
+                    if (retriedWithoutSearch) {
+                        searchDisabledModels[modelName] = true
+                    }
+                    modelCooldowns.remove(modelName)
+                    notFoundModels.remove(modelName)
+                    _activeModel.value = modelName
+                    return reply
+                } catch (err: GeminiApiException) {
+                    // Геоблок и плохой ключ общие для всех моделей — сразу выходим
+                    if (err.isGeoBlocked || err.httpCode == 401 || err.httpCode == 403) {
+                        throw err
+                    }
+                    // Если отказал инструмент google_search — один раз повторяем эту же модель без него
+                    if ((err.httpCode == 400 || err.httpCode == 429) && useSearch) {
+                        useSearch = false
+                        retriedWithoutSearch = true
+                        continue
+                    }
+
+                    bestError = pickMoreRelevantError(bestError, err)
+
+                    if (err.httpCode == 404) {
+                        notFoundModels[modelName] = true
+                        modelCooldowns[modelName] = System.currentTimeMillis() + COOLDOWN_NOT_FOUND_MS
+                        Log.w(TAG, "Model $modelName returned 404, muted for 24h")
+                        if (!cfg.autoSwitchModels) throw err
+                        break
+                    }
+
+                    if (err.httpCode == 429) {
+                        val pauseMs = if (err.isDailyOrZeroQuota) COOLDOWN_DAILY_MS else COOLDOWN_MINUTE_MS
+                        modelCooldowns[modelName] = System.currentTimeMillis() + pauseMs
+                        Log.w(TAG, "Model $modelName hit 429, cooldown=${pauseMs / 1000}s")
+                        if (!cfg.autoSwitchModels) throw err
+                        break
+                    }
+
+                    if (err.httpCode in setOf(500, 502, 503, 504)) {
+                        if (serverRetriesLeft > 0) {
+                            serverRetriesLeft--
+                            delay(800L)
+                            continue
+                        }
+                        modelCooldowns[modelName] = System.currentTimeMillis() + COOLDOWN_MINUTE_MS
+                        if (!cfg.autoSwitchModels) throw err
+                        break
+                    }
+
+                    throw err
+                } catch (err: IOException) {
+                    if (serverRetriesLeft > 0) {
+                        serverRetriesLeft--
+                        delay(700L)
+                        continue
+                    }
+                    throw err
+                }
+            }
+        }
+
+        throw bestError ?: IOException("Не удалось подключиться к Gemini")
+    }
+
+    /** Не даём ошибке 404 от запасной модели перетереть реальную 429 от рабочих моделей. */
+    private fun pickMoreRelevantError(current: Throwable?, incoming: GeminiApiException): Throwable {
+        if (current !is GeminiApiException) return incoming
+        if (current.httpCode == 429 && incoming.httpCode == 404) return current
+        return incoming
     }
 
     private suspend fun sendGeminiRequest(
@@ -919,6 +1022,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             .ifBlank { "https://generativelanguage.googleapis.com" },
         model = prefs.getString(KEY_MODEL, DEFAULT_MODEL).orEmpty().ifBlank { DEFAULT_MODEL },
         speakResponses = prefs.getBoolean(KEY_SPEAK, true),
+        autoSwitchModels = prefs.getBoolean(KEY_AUTO_SWITCH, true),
     )
 }
 
