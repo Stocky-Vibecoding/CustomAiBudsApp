@@ -1602,6 +1602,7 @@ private fun SettingsSheetContent(
 ) {
     val context = LocalContext.current
     val cfg by gemini.config.collectAsState()
+    val activeModel by gemini.activeModel.collectAsState()
     val messages by gemini.messages.collectAsState()
     val isBusy by gemini.isBusy.collectAsState()
     val announceCalls by callAnnouncer.enabled.collectAsState()
@@ -1611,6 +1612,7 @@ private fun SettingsSheetContent(
     var baseUrl by remember(cfg) { mutableStateOf(cfg.baseUrl) }
     var model by remember(cfg) { mutableStateOf(cfg.model) }
     var speak by remember(cfg) { mutableStateOf(cfg.speakResponses) }
+    var autoSwitch by remember(cfg) { mutableStateOf(cfg.autoSwitchModels) }
     var promptInput by remember { mutableStateOf("") }
 
     fun applyConfigIfChanged() {
@@ -1619,6 +1621,7 @@ private fun SettingsSheetContent(
             baseUrl = baseUrl,
             model = model,
             speakResponses = speak,
+            autoSwitchModels = autoSwitch,
         )
         if (candidate != cfg) {
             gemini.updateConfig(candidate)
@@ -1674,10 +1677,38 @@ private fun SettingsSheetContent(
         OutlinedTextField(
             value = model,
             onValueChange = { model = it },
-            label = { Text("Модель (например, gemini-3-flash-preview)") },
+            label = {
+                Text(
+                    if (autoSwitch) {
+                        "Приоритетная модель (старт с неё)"
+                    } else {
+                        "Принудительная модель"
+                    },
+                )
+            },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Автопереключение моделей", fontWeight = FontWeight.Medium)
+                Text(
+                    text = if (autoSwitch) {
+                        "При лимите сам переходит на резерв и возвращается • сейчас: $activeModel"
+                    } else {
+                        "Принудительно только выбранная модель"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(checked = autoSwitch, onCheckedChange = { autoSwitch = it })
+        }
 
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1696,6 +1727,7 @@ private fun SettingsSheetContent(
                         baseUrl = baseUrl,
                         model = model,
                         speakResponses = speak,
+                        autoSwitchModels = autoSwitch,
                     ),
                 )
                 Toast.makeText(context, "Настройки ИИ сохранены!", Toast.LENGTH_SHORT).show()
