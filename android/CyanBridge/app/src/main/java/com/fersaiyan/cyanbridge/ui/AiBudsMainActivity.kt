@@ -133,7 +133,9 @@ import androidx.lifecycle.LifecycleOwner
 import com.fersaiyan.cyanbridge.ai.CarModeAudioManager
 import com.fersaiyan.cyanbridge.ai.GeminiConfig
 import com.fersaiyan.cyanbridge.ai.GeminiGlassAssistant
+import com.fersaiyan.cyanbridge.ai.IncomingCallAnnouncer
 import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsManager
+import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsProtocol
 import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsState
 import com.fersaiyan.cyanbridge.media.ColorPreset
 import com.fersaiyan.cyanbridge.media.MediaProcessingOptions
@@ -165,6 +167,9 @@ class AiBudsMainActivity : ComponentActivity() {
             }
             add(Manifest.permission.ACCESS_FINE_LOCATION)
             add(Manifest.permission.RECORD_AUDIO)
+            add(Manifest.permission.READ_PHONE_STATE)
+            add(Manifest.permission.READ_CALL_LOG)
+            add(Manifest.permission.READ_CONTACTS)
         }.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
 
         if (perms.isNotEmpty()) {
@@ -173,6 +178,7 @@ class AiBudsMainActivity : ComponentActivity() {
 
         tuneBuds = TuneBudsManager.getInstance(applicationContext)
         val carMode = CarModeAudioManager.getInstance(applicationContext)
+        val callAnnouncer = IncomingCallAnnouncer.getInstance(applicationContext)
         gemini = GeminiGlassAssistant.getInstance(applicationContext)
         gemini.bindToGlasses(tuneBuds)
 
@@ -193,6 +199,7 @@ class AiBudsMainActivity : ComponentActivity() {
                 AiBudsRootScreen(
                     tuneBuds = tuneBuds,
                     carMode = carMode,
+                    callAnnouncer = callAnnouncer,
                     gemini = gemini,
                 )
             }
@@ -220,6 +227,7 @@ class AiBudsMainActivity : ComponentActivity() {
 private fun AiBudsRootScreen(
     tuneBuds: TuneBudsManager,
     carMode: CarModeAudioManager,
+    callAnnouncer: IncomingCallAnnouncer,
     gemini: GeminiGlassAssistant,
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
@@ -307,6 +315,8 @@ private fun AiBudsRootScreen(
             SettingsSheetContent(
                 gemini = gemini,
                 tuneBuds = tuneBuds,
+                glassState = glassState,
+                callAnnouncer = callAnnouncer,
             )
         }
     }
@@ -1238,7 +1248,6 @@ private fun InlineVideoPlayer(file: File, modifier: Modifier = Modifier) {
         }
     }
 
-    // Ставим плеер на паузу при сворачивании приложения или блокировке экрана
     DisposableEffect(lifecycleOwner, file.absolutePath) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
@@ -1262,7 +1271,6 @@ private fun InlineVideoPlayer(file: File, modifier: Modifier = Modifier) {
         }
     }
 
-    // Обновляем ползунок перемотки пока идёт воспроизведение
     LaunchedEffect(playerRef, isPlaying, isScrubbing) {
         while (isActive && isPlaying) {
             val mp = playerRef
@@ -1541,12 +1549,15 @@ private fun MediaGridTile(
 private fun SettingsSheetContent(
     gemini: GeminiGlassAssistant,
     tuneBuds: TuneBudsManager,
+    glassState: TuneBudsState,
+    callAnnouncer: IncomingCallAnnouncer,
 ) {
     val context = LocalContext.current
     val cfg by gemini.config.collectAsState()
     val messages by gemini.messages.collectAsState()
     val templeLog by gemini.lastTempleLog.collectAsState()
     val isBusy by gemini.isBusy.collectAsState()
+    val announceCalls by callAnnouncer.enabled.collectAsState()
     val scope = rememberCoroutineScope()
 
     var apiKey by remember(cfg) { mutableStateOf(cfg.apiKey) }
@@ -1562,7 +1573,88 @@ private fun SettingsSheetContent(
             .padding(horizontal = 20.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        Text("Настройки ИИ", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+        Text("Настройки", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Озвучивать имя звонящего", fontWeight = FontWeight.Medium)
+                Text(
+                    "Произносит имя контакта в очки при входящем вызове",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = announceCalls,
+                onCheckedChange = { callAnnouncer.setEnabled(it) },
+            )
+        }
+
+        HorizontalDivider()
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "Слоты кнопок очков (0x05)",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            TextButton(
+                onClick = { tuneBuds.requestKeySettings() },
+                enabled = glassState.protocolState == "CONNECTED",
+            ) {
+                Text("Считать")
+            }
+        }
+
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                if (glassState.keySettings.isEmpty()) {
+                    Text(
+                        text = if (glassState.protocolState == "CONNECTED") {
+                            "Нет данных — нажми «Считать»"
+                        } else {
+                            "Подключи очки, чтобы прочитать заводские слоты"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    glassState.keySettings.toSortedMap().forEach { (slotId, funcId) ->
+                        Text(
+                            text = "${keySlotLabel(slotId)}: ${TuneBudsProtocol.keyFunctionLabel(funcId)} ($funcId)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.secondary,
+                        )
+                    }
+                }
+                glassState.rawKeySettingsHex?.let { hex ->
+                    Text(
+                        text = "HEX: $hex",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+
+        HorizontalDivider()
+
+        Text("Ассистент Gemini", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
 
         OutlinedTextField(
             value = apiKey,
@@ -1676,6 +1768,18 @@ private fun SettingsSheetContent(
 
         Spacer(Modifier.height(20.dp))
     }
+}
+
+private fun keySlotLabel(slotId: Int): String = when (slotId) {
+    TuneBudsProtocol.KEY_LEFT_SINGLE -> "L 1× (1)"
+    TuneBudsProtocol.KEY_RIGHT_SINGLE -> "R 1× (2)"
+    TuneBudsProtocol.KEY_LEFT_DOUBLE -> "L 2× (3)"
+    TuneBudsProtocol.KEY_RIGHT_DOUBLE -> "R 2× (4)"
+    TuneBudsProtocol.KEY_LEFT_TRIPLE -> "L 3× (5)"
+    TuneBudsProtocol.KEY_RIGHT_TRIPLE -> "R 3× (6)"
+    TuneBudsProtocol.KEY_LEFT_LONG -> "L Удерж. (7)"
+    TuneBudsProtocol.KEY_RIGHT_LONG -> "R Удерж. (8)"
+    else -> "Слот $slotId"
 }
 
 private fun formatDurationSec(totalSec: Long): String {
