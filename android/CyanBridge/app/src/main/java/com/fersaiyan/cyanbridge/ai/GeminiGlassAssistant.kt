@@ -68,7 +68,18 @@ data class GeminiChatMessage(
 private class GeminiApiException(
     val httpCode: Int,
     val rawBody: String,
-) : IOException("HTTP $httpCode: ${rawBody.take(180)}") {
+    val modelName: String,
+) : IOException("HTTP $httpCode ($modelName): ${rawBody.take(180)}") {
+    val serverMessage: String by lazy {
+        runCatching {
+            JSONObject(rawBody)
+                .optJSONObject("error")
+                ?.optString("message")
+                ?.trim()
+                .orEmpty()
+        }.getOrDefault("").ifBlank { rawBody.take(140) }
+    }
+
     val isGeoBlocked: Boolean
         get() = httpCode == 400 && (
             rawBody.contains("User location is not supported", ignoreCase = true) ||
@@ -111,11 +122,6 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 "НЕ отвечай текстом от себя, а верни строго одну строку в формате: " +
                 "NEED_PHOTO: <краткий вопрос пользователя на русском>. " +
                 "Во всех остальных случаях сразу дай краткий голосовой ответ на вопрос пользователя."
-
-        private val FALLBACK_MODELS = listOf(
-            "gemini-3.5-flash-lite",
-            "gemini-3.5-flash",
-        )
 
         private val VISION_TRIGGERS = listOf(
             "посмотри",
@@ -192,7 +198,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             baseUrl = newConfig.baseUrl.trim().trimEnd('/').ifBlank {
                 "https://generativelanguage.googleapis.com"
             },
-            model = newConfig.model.trim().ifBlank { "gemini-2.5-flash" },
+            model = newConfig.model.trim().removePrefix("models/").ifBlank { "gemini-2.5-flash" },
         )
         prefs.edit()
             .putString(KEY_API, cleaned.apiKey)
@@ -607,7 +613,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 null
             }
 
-            val firstText = sendGeminiWithFallback(
+            val firstText = sendGeminiWithRetry(
                 cfg = cfg,
                 prompt = if (initialPhoto == null && canUseGlasses) {
                     "$VISION_ROUTER_INSTRUCTION\n\nЗапрос пользователя: $prompt"
@@ -632,9 +638,8 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
 
             deliverReply(finalText, cfg)
         } catch (error: Throwable) {
-            val userMsg = formatUserError(error)
             Log.e(TAG, "Gemini ask error: ${error.message}", error)
-            deliverReply(userMsg, cfg)
+            deliverError(error, cfg)
         } finally {
             busyGuard.set(false)
             _isBusy.value = false
@@ -648,8 +653,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
     ) {
         val cfg = _config.value
         if (cfg.apiKey.isBlank()) {
-            val msg = "Укажи API-ключ Gemini в настройках."
-            deliverReply(msg, cfg)
+            deliverReply("Укажи API-ключ Gemini в настройках.", cfg)
             return
         }
 
@@ -661,7 +665,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 "Выслушай голосовой запрос в аудио и сразу дай краткий ответ на русском."
             }
 
-            val firstText = sendGeminiWithFallback(
+            val firstText = sendGeminiWithRetry(
                 cfg = cfg,
                 prompt = prompt,
                 jpegBytes = null,
@@ -684,9 +688,8 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
                 deliverReply(firstText, cfg)
             }
         } catch (error: Throwable) {
-            val userMsg = formatUserError(error)
             Log.e(TAG, "Gemini voice error: ${error.message}", error)
-            deliverReply(userMsg, cfg)
+            deliverError(error, cfg)
         }
     }
 
@@ -697,7 +700,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
     ): String {
         val photoBytes = tuneBudsManager.capturePhotoForAi()
             ?: return tuneBudsManager.state.value.lastError ?: "Не удалось получить фото с очков."
-        return sendGeminiWithFallback(
+        return sendGeminiWithRetry(
             cfg = cfg,
             prompt = question,
             jpegBytes = photoBytes,
@@ -717,21 +720,37 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
             .orEmpty()
     }
 
-    private fun formatUserError(error: Throwable): String = when {
-        error is GeminiApiException && error.isGeoBlocked ->
-            "Gemini заблокирован по региону. Проверь VPN или прокси."
-        error is GeminiApiException && (error.httpCode == 401 || error.httpCode == 403) ->
-            "Неверный API-ключ Gemini."
-        error is GeminiApiException && error.httpCode == 404 ->
-            "Модель Gemini устарела или не найдена. Обнови имя модели в настройках."
-        error is GeminiApiException && error.httpCode == 429 ->
-            "Превышен лимит запросов Gemini, попробуй чуть позже."
-        error is GeminiApiException ->
-            "Ошибка сервера Gemini (код ${error.httpCode})."
-        error is IOException ->
-            "Нет связи с сервером Gemini. Проверь интернет или VPN."
-        else ->
-            "Ошибка ассистента: ${error.message ?: "нет ответа"}"
+    private fun deliverError(error: Throwable, cfg: GeminiConfig): String {
+        val keyTag = cfg.apiKey.takeLast(4).ifBlank { "----" }
+        val spoken = when {
+            error is GeminiApiException && error.isGeoBlocked ->
+                "Gemini заблокирован по региону. Проверь VPN или прокси."
+            error is GeminiApiException && (error.httpCode == 401 || error.httpCode == 403) ->
+                "Неверный API-ключ Gemini."
+            error is GeminiApiException && error.httpCode == 404 ->
+                "Модель Gemini не найдена. Проверь название модели в настройках."
+            error is GeminiApiException && error.httpCode == 429 ->
+                "Превышен лимит запросов Gemini."
+            error is GeminiApiException ->
+                "Ошибка сервера Gemini, код ${error.httpCode}."
+            error is IOException ->
+                "Нет связи с сервером Gemini. Проверь интернет или VPN."
+            else ->
+                "Ошибка ассистента."
+        }
+        val chatText = when (error) {
+            is GeminiApiException ->
+                "[${error.modelName} • ...$keyTag] HTTP ${error.httpCode}: ${error.serverMessage}"
+            is IOException ->
+                "[${cfg.model} • ...$keyTag] Нет связи: ${error.message ?: "проверь интернет или VPN"}"
+            else ->
+                "[${cfg.model} • ...$keyTag] Ошибка: ${error.message ?: "нет ответа"}"
+        }
+        appendMessage(isUser = false, text = chatText)
+        if (cfg.speakResponses) {
+            speak(spoken)
+        }
+        return chatText
     }
 
     private fun deliverReply(rawReply: String, cfg: GeminiConfig): String {
@@ -743,56 +762,55 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         return cleanReply
     }
 
-    private suspend fun sendGeminiWithFallback(
+    /**
+     * Шлёт запрос строго в выбранную пользователем модель (без скрытой подмены на мёртвые фоллбэки).
+     * На HTTP 429 не тратит квоту повторными попытками; повторяет только 1 раз при сетевом сбое или 5xx.
+     */
+    private suspend fun sendGeminiWithRetry(
         cfg: GeminiConfig,
         prompt: String,
         jpegBytes: ByteArray?,
         audioBytes: ByteArray?,
         audioMime: String?,
     ): String {
-        val modelsToTry = (listOf(cfg.model) + FALLBACK_MODELS).distinct()
-        var lastError: Throwable? = null
+        var useSearch = true
+        var retriesLeft = 1
 
-        for ((index, modelName) in modelsToTry.withIndex()) {
-            var useSearch = true
-            var attemptsLeft = if (index == 0) 3 else 2
-
-            while (attemptsLeft > 0) {
-                attemptsLeft--
-                try {
-                    return sendGeminiRequest(
-                        cfg = cfg.copy(model = modelName),
-                        prompt = prompt,
-                        jpegBytes = jpegBytes,
-                        audioBytes = audioBytes,
-                        audioMime = audioMime,
-                        enableGoogleSearch = useSearch,
-                    )
-                } catch (err: GeminiApiException) {
-                    lastError = err
-                    if (err.isGeoBlocked) throw err
-                    if (err.httpCode == 404) {
-                        Log.w(TAG, "Model $modelName unavailable (HTTP 404), trying next fallback")
-                        break
-                    }
-                    // Если прокси/модель не принимает google_search — пробуем сразу без него
-                    if (err.httpCode == 400 && useSearch) {
-                        useSearch = false
-                        attemptsLeft = max(attemptsLeft, 1)
-                        continue
-                    }
-                    val isTransient = err.httpCode in setOf(429, 500, 502, 503, 504)
-                    if (!isTransient) throw err
-                    Log.w(TAG, "Model $modelName transient HTTP ${err.httpCode}, retries left=$attemptsLeft")
-                    delay(800L)
-                } catch (err: IOException) {
-                    lastError = err
-                    Log.w(TAG, "Model $modelName network error (${err.message}), retries left=$attemptsLeft")
-                    delay(700L)
+        while (true) {
+            try {
+                return sendGeminiRequest(
+                    cfg = cfg,
+                    prompt = prompt,
+                    jpegBytes = jpegBytes,
+                    audioBytes = audioBytes,
+                    audioMime = audioMime,
+                    enableGoogleSearch = useSearch,
+                )
+            } catch (err: GeminiApiException) {
+                if (err.isGeoBlocked) throw err
+                // Если модель/прокси не поддерживает google_search — пробуем один раз без него
+                if (err.httpCode == 400 && useSearch) {
+                    useSearch = false
+                    continue
                 }
+                val isServerGlitch = err.httpCode in setOf(500, 502, 503, 504)
+                if (isServerGlitch && retriesLeft > 0) {
+                    retriesLeft--
+                    Log.w(TAG, "Model ${cfg.model} HTTP ${err.httpCode}, retrying once")
+                    delay(900L)
+                    continue
+                }
+                throw err
+            } catch (err: IOException) {
+                if (retriesLeft > 0) {
+                    retriesLeft--
+                    Log.w(TAG, "Model ${cfg.model} network error (${err.message}), retrying once")
+                    delay(700L)
+                    continue
+                }
+                throw err
             }
         }
-        throw lastError ?: IOException("Не удалось подключиться к Gemini")
     }
 
     private suspend fun sendGeminiRequest(
@@ -850,7 +868,7 @@ class GeminiGlassAssistant private constructor(private val context: Context) {
         httpClient.newCall(request).execute().use { response ->
             val rawBody = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
-                throw GeminiApiException(response.code, rawBody)
+                throw GeminiApiException(response.code, rawBody, cfg.model)
             }
             val root = JSONObject(rawBody)
             val candidates = root.optJSONArray("candidates")
