@@ -7,7 +7,10 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.net.Uri
+import android.os.Build
 import android.provider.ContactsContract
 import android.speech.tts.TextToSpeech
 import android.telephony.TelephonyManager
@@ -26,7 +29,7 @@ import kotlinx.coroutines.withContext
 import java.util.Locale
 
 /**
- * Озвучивает имя звонящего в очки при входящем вызове.
+ * Озвучивает имя звонящего строго в Bluetooth-очки при входящем вызове.
  * Запускается и останавливается вместе с AiBudsForegroundService.
  */
 class IncomingCallAnnouncer private constructor(private val context: Context) {
@@ -48,6 +51,7 @@ class IncomingCallAnnouncer private constructor(private val context: Context) {
     }
 
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val _enabled = MutableStateFlow(prefs.getBoolean(KEY_ENABLED, true))
@@ -118,9 +122,10 @@ class IncomingCallAnnouncer private constructor(private val context: Context) {
             if (status == TextToSpeech.SUCCESS) {
                 val res = tts?.setLanguage(Locale("ru", "RU"))
                 ttsReady = res != TextToSpeech.LANG_MISSING_DATA && res != TextToSpeech.LANG_NOT_SUPPORTED
+                // USAGE_ASSISTANT идёт строго в Bluetooth-гарнитуру и не дублируется на динамик телефона
                 tts?.setAudioAttributes(
                     AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                        .setUsage(AudioAttributes.USAGE_ASSISTANT)
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build(),
                 )
@@ -128,8 +133,18 @@ class IncomingCallAnnouncer private constructor(private val context: Context) {
         }
     }
 
+    private fun hasBluetoothAudioOutput(): Boolean {
+        val outputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        return outputs.any { device ->
+            device.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                    device.type == AudioDeviceInfo.TYPE_BLE_HEADSET)
+        }
+    }
+
     private fun handleRinging(rawNumber: String?) {
-        if (!_enabled.value) return
+        if (!_enabled.value || !hasBluetoothAudioOutput()) return
         isRinging = true
         if (announcedForCurrentCall) return
 
@@ -149,7 +164,6 @@ class IncomingCallAnnouncer private constructor(private val context: Context) {
                 speakWhileRinging(phrase)
             }
         } else if (fallbackJob?.isActive != true) {
-            // Android 9+ сначала шлёт RINGING без номера, а следом — второй пакет с номером
             fallbackJob = scope.launch {
                 delay(NUMBER_WAIT_FALLBACK_MS)
                 if (isRinging && !announcedForCurrentCall) {
@@ -161,10 +175,10 @@ class IncomingCallAnnouncer private constructor(private val context: Context) {
     }
 
     private suspend fun speakWhileRinging(phrase: String) {
-        if (!isRinging || !_enabled.value) return
+        if (!isRinging || !_enabled.value || !hasBluetoothAudioOutput()) return
         speak(phrase)
         delay(REPEAT_DELAY_MS)
-        if (isRinging && _enabled.value) {
+        if (isRinging && _enabled.value && hasBluetoothAudioOutput()) {
             speak(phrase)
         }
     }
@@ -209,7 +223,7 @@ class IncomingCallAnnouncer private constructor(private val context: Context) {
 
     private fun speak(text: String) {
         ensureTts()
-        if (!ttsReady) return
+        if (!ttsReady || !hasBluetoothAudioOutput()) return
         tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "call_${System.currentTimeMillis()}")
     }
 }
