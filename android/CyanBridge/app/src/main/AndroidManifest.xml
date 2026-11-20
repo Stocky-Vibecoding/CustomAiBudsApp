@@ -93,6 +93,11 @@
         </activity>
 
         <service
+            android:name=".devices.tunebuds.AiBudsGlassService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice|microphone" />
+
+        <service
             android:name=".ui.CarModeTileService"
             android:exported="true"
             android:icon="@drawable/ic_aibuds_launcher"
